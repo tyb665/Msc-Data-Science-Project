@@ -89,8 +89,8 @@ for (i in seq_len(nrow(filtered_mainshocks))) {
 }
 
 # ==== Plot all sequences ====
-combined_all <- wrap_plots(plot_list, ncol = 2)
-print(combined_all)
+# combined_all <- wrap_plots(plot_list, ncol = 2)
+# print(combined_all)
 
 # ==== Filter the main shocks after 1990 from the sequence_list ====
 recent_indices <- which(sapply(sequence_list, function(seq) seq$mainshock_time >= as.POSIXct("1990-01-01")))
@@ -100,9 +100,430 @@ plot_list_recent <- plot_list[recent_indices]
 combined_recent <- wrap_plots(plot_list_recent, ncol = 2)
 print(combined_recent)
 
-##############################
+##############
+# Omori method
+##############
+##############
+# Omori method (with fallback & symmetrical windows)
+##############
+
+# ==== Libraries ====
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(minpack.lm)
+
+Sys.setlocale("LC_TIME", "English")
+
+# ==== Load data ====
+eq_data <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv") %>%
+  rename(mag = magnitude) %>%
+  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
+  drop_na(time, mag, latitude, longitude)
+
+# ==== Extract mainshocks (M ≥ 6.5, post-1990) ====
+mainshocks_all <- eq_data %>%
+  filter(mag >= 6.5, time >= as.POSIXct("1990-01-01")) %>%
+  arrange(time)
+
+# ==== De-duplicate mainshocks ====
+window_days <- 60
+lat_window <- 1.5
+lon_window <- 1.5
+
+filtered_mainshocks <- mainshocks_all[1, ]
+for (i in 2:nrow(mainshocks_all)) {
+  new_shock <- mainshocks_all[i, ]
+  overlap <- any(
+    abs(difftime(filtered_mainshocks$time, new_shock$time, units = "days")) <= window_days &
+      abs(filtered_mainshocks$latitude - new_shock$latitude) <= lat_window &
+      abs(filtered_mainshocks$longitude - new_shock$longitude) <= lon_window
+  )
+  if (!overlap) {
+    filtered_mainshocks <- bind_rows(filtered_mainshocks, new_shock)
+  }
+}
+
+# ==== Omori fit function with fallback ====
+estimate_omori_window <- function(seq_data, t0, max_day = 120, decay_ratio = 20, fallback_day = 60, seq_id = NULL) {
+  daily_counts <- seq_data %>%
+    filter(time > t0) %>%
+    mutate(day = as.integer(difftime(time, t0, units = "days"))) %>%
+    count(day) %>%
+    complete(day = 1:max_day, fill = list(n = 0))
+  
+  tryCatch({
+    fit <- nlsLM(n ~ K / (day + c)^p,
+                 data = daily_counts %>% filter(n > 0),
+                 start = list(K = max(daily_counts$n), c = 0.5, p = 1.0),
+                 lower = c(1, 0.01, 0.6),
+                 upper = c(1e5, 5, 2.5),
+                 control = list(maxiter = 1000))
+    
+    daily_counts$pred <- predict(fit, newdata = daily_counts)
+    
+    lambda_0 <- predict(fit, newdata = data.frame(day = 1))
+    target_value <- lambda_0 / decay_ratio
+    
+    cutoff_day <- min(daily_counts$day[daily_counts$pred < target_value], na.rm = TRUE)
+    
+    if (!is.finite(cutoff_day)) {
+      cutoff_day <- fallback_day
+      cutoff_type <- "fallback"
+    } else {
+      cutoff_type <- "omori"
+    }
+    
+    cat(sprintf("✅ Seq %s: K = %.1f, c = %.2f, p = %.2f | λ₀ = %.1f → cutoff = %s (%s)\n",
+                seq_id, coef(fit)[["K"]], coef(fit)[["c"]], coef(fit)[["p"]],
+                lambda_0,
+                paste0(cutoff_day, " days"), cutoff_type))
+    
+    list(
+      cutoff = cutoff_day,
+      cutoff_type = cutoff_type,
+      fit = fit,
+      data = daily_counts
+    )
+  }, error = function(e) {
+    cat(sprintf("❌ Seq %s: Fit failed - %s → fallback to %d days\n", seq_id, e$message, fallback_day))
+    list(
+      cutoff = fallback_day,
+      cutoff_type = "fallback_fit_failed",
+      fit = NULL,
+      data = daily_counts
+    )
+  })
+}
+
+# ==== Main loop ====
+sequence_list <- list()
+cutoff_types <- c()
+
+for (i in seq_len(nrow(filtered_mainshocks))) {
+  mainshock <- filtered_mainshocks[i, ]
+  
+  # 原始主震时间用于展示
+  t0_orig <- mainshock$time
+  mag0 <- mainshock$mag
+  time_win_before <- 30
+  
+  # 用于窗口计算的主震时间（整天截断）
+  t0 <- as.POSIXct(as.Date(t0_orig), tz = "UTC")
+  
+  full_window <- eq_data %>%
+    filter(time > t0, time <= t0 + days(120))
+  
+  if (nrow(full_window) < 30) next
+  
+  omori_result <- estimate_omori_window(full_window, t0, seq_id = i)
+  time_win_after <- omori_result$cutoff
+  cutoff_type <- omori_result$cutoff_type
+  
+  seq_data <- eq_data %>%
+    filter(time >= t0 - days(time_win_before),
+           time <= t0 + days(time_win_after))
+  
+  if (nrow(seq_data) == 0) next
+  
+  cutoff_types <- c(cutoff_types, cutoff_type)
+  
+  sequence_list[[i]] <- list(
+    mainshock_time = t0_orig,
+    mag = mag0,
+    time_win_before = time_win_before,
+    time_win_after = time_win_after,
+    cutoff_type = cutoff_type,
+    sequence_data = seq_data
+  )
+}
+
+# ==== Fallback override: force all to ±60 days if any fallback ====
+if (any(cutoff_types != "omori")) {
+  message("⚠️ Omori fit failed in some sequences. Forcing all sequences to ±60 days.")
+  for (j in seq_along(sequence_list)) {
+    t0_j <- as.POSIXct(as.Date(sequence_list[[j]]$mainshock_time), tz = "UTC")
+    sequence_list[[j]]$time_win_before <- 30
+    sequence_list[[j]]$time_win_after <- 60
+    sequence_list[[j]]$cutoff_type <- "forced_fixed"
+    sequence_list[[j]]$sequence_data <- eq_data %>%
+      filter(time >= t0_j - days(30), time <= t0_j + days(60))
+  }
+}
+
+# ==== Plotting ====
+plot_list <- list()
+for (i in seq_along(sequence_list)) {
+  seq_info <- sequence_list[[i]]
+  seq_data <- seq_info$sequence_data
+  t0_orig <- seq_info$mainshock_time
+  mag0 <- seq_info$mag
+  time_win_before <- seq_info$time_win_before
+  time_win_after <- seq_info$time_win_after
+  cutoff_type <- seq_info$cutoff_type
+  n_events <- nrow(seq_data)
+  
+  mainshock_point <- seq_data %>% filter(time == t0_orig & mag == mag0)
+  
+  subtitle <- paste0("±", time_win_before, "/", time_win_after, " days",
+                     if (!is.null(cutoff_type)) paste0(" (", cutoff_type, ")") else "")
+  
+  p <- ggplot(seq_data, aes(x = time, y = mag)) +
+    geom_point(color = "orange", alpha = 0.7, size = 0.1) +
+    geom_point(data = mainshock_point, aes(x = time, y = mag), color = "red", size = 1) +
+    geom_vline(xintercept = as.numeric(t0_orig), color = "red", linetype = "dashed") +
+    annotate("text", x = max(seq_data$time), y = max(seq_data$mag, na.rm = TRUE) + 0.3,
+             label = paste0("n = ", n_events), hjust = 1, size = 3.5) +
+    labs(
+      title = paste0("Seq ", i, " | M", round(mag0, 1), " @ ", format(t0_orig, "%Y-%m-%d")),
+      subtitle = subtitle,
+      x = "Time", y = "Magnitude"
+    ) +
+    theme_minimal(base_size = 11) +
+    coord_cartesian(xlim = c(t0 - days(time_win_before), t0 + days(time_win_after)))
+
+  plot_list[[i]] <- p
+}
+
+# ==== Show final plots ====
+wrap_plots(plot_list, ncol = 2)
+
+
+
+################################################################################
+################################################################################
+# Use the whole data of 1990-2021, m0 = 2.5, compare 3 strategies of mesh point
+################################################################################
+################################################################################
+# ==== Libraries ====
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(INLA)
+library(inlabru)
+library(patchwork)
+
+# ==== Set environment ====
+Sys.setlocale("LC_TIME", "English")
+Sys.setenv(TMPDIR = "D:/R_temp")  # 设置临时目录（根据你电脑可修改）
+
+# ==== Load data ====
+file_path <- "D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv"
+eq_data <- read_csv(file_path) %>%
+  rename(mag = magnitude) %>%
+  drop_na(time, mag, latitude, longitude) %>%
+  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
+  filter(time >= as.POSIXct("1990-01-01"),
+         time <= as.POSIXct("2021-12-31"))
+
+# ==== Filter for m0 = 2.5 ====
+m0 <- 2.5
+eq_m <- eq_data %>%
+  filter(mag >= m0) %>%
+  mutate(
+    day = as.numeric(difftime(time, min(time), units = "days")),
+    mags = mag - m0
+  )
+
+# ==== Define 3 mesh types ====
+
+# -- Mesh 1: Uniform spacing --
+mesh1 <- fm_mesh_1d(seq(min(eq_m$day), max(eq_m$day), by = 100),
+                    cutoff = 30, degree = 2, boundary = "free")
+
+# -- Mesh 2: KDE-weighted sampling --
+set.seed(42)
+kde <- density(eq_m$day, bw = 200)
+mesh_points2 <- sample(kde$x, size = 120, prob = kde$y, replace = FALSE)
+mesh_points2 <- sort(unique(c(min(eq_m$day), mesh_points2, max(eq_m$day))))
+mesh2 <- fm_mesh_1d(mesh_points2, cutoff = 30, degree = 2, boundary = "free")
+
+# -- Mesh 3: Manually segmented mesh --
+dense1 <- seq(0, 3000, by = 30)
+dense2 <- seq(3000, 7000, by = 70)
+dense3 <- seq(7000, max(eq_m$day), by = 150)
+mesh_points3 <- sort(unique(c(dense1, dense2, dense3)))
+mesh3 <- fm_mesh_1d(mesh_points3, cutoff = 30, degree = 2, boundary = "free")
+
+# ==== Fit & Predict Function ====
+fit_and_predict <- function(mesh, label) {
+  spde_model <- inla.spde2.pcmatern(
+    mesh,
+    prior.range = c(200, 0.01),
+    prior.sigma = c(0.5, 0.01)
+  )
+  
+  comp <- mags ~ field(day, model = spde_model) + Intercept(1)
+  
+  fit <- bru(
+    components = comp,
+    data = eq_m,
+    family = "exponential",
+    options = list(control.compute = list(dic = TRUE, waic = TRUE))
+  )
+  
+  pred <- predict(fit, data.frame(day = seq(0, max(eq_m$day), by = 20)),
+                  ~ exp(field + Intercept) / log(10), n.samples = 1000)
+  
+  pred$mesh_type <- label
+  return(list(pred = pred, dic = fit$dic$dic, waic = fit$waic$waic, mesh = mesh))
+}
+
+# ==== Run models ====
+res1 <- fit_and_predict(mesh1, "Uniform mesh")
+res2 <- fit_and_predict(mesh2, "KDE-based mesh")
+res3 <- fit_and_predict(mesh3, "Segmented mesh")
+
+# ==== Top plot: Magnitude vs Time ====
+p0 <- ggplot(eq_m, aes(x = time, y = mag)) +
+  geom_point(alpha = 0.4, size = 0.7) +
+  labs(
+    title = "Magnitude over time",
+    x = "Time", y = "Magnitude"
+  ) +
+  theme_minimal(base_size = 12)
+
+# ==== Helper: Build b-value plot with mesh lines ====
+build_b_plot <- function(pred, mesh, title) {
+  mesh_lines <- data.frame(day = mesh$loc)
+  
+  ggplot(pred, aes(x = day, y = mean)) +
+    geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
+    geom_line(color = "black") +
+    geom_vline(data = mesh_lines, aes(xintercept = day), color = "red", alpha = 0.3) +
+    labs(
+      title = title,
+      x = "Days since 1990-01-01", y = "b-value"
+    ) +
+    coord_cartesian(ylim = c(0.3, 1.7)) +
+    theme_minimal(base_size = 12)
+}
+
+# ==== Bottom 3 plots with mesh overlays ====
+p1 <- build_b_plot(res1$pred, res1$mesh, "Uniform mesh")
+p2 <- build_b_plot(res2$pred, res2$mesh, "KDE-based mesh")
+p3 <- build_b_plot(res3$pred, res3$mesh, "Segmented mesh")
+
+# ==== Combine 4 plots vertically ====
+final_plot <- p0 / p1 / p2 / p3
+print(final_plot)
+
+# ==== (Optional) Save to file ====
+# ggsave("b_value_mesh_comparison.png", final_plot, width = 10, height = 14, dpi = 300)
+
+
+##the compare results of mesh strategies
+# ==== Libraries ====
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(INLA)
+library(inlabru)
+
+# ==== Set environment ====
+Sys.setlocale("LC_TIME", "English")
+Sys.setenv(TMPDIR = "D:/R_temp")
+
+# ==== Load data ====
+file_path <- "D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv"
+eq_data <- read_csv(file_path) %>%
+  rename(mag = magnitude) %>%
+  drop_na(time, mag, latitude, longitude) %>%
+  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
+  filter(time >= as.POSIXct("1990-01-01"),
+         time <= as.POSIXct("2021-12-31"))
+
+# ==== Filter for m0 = 2.5 ====
+m0 <- 2.5
+eq_m <- eq_data %>%
+  filter(mag >= m0) %>%
+  mutate(
+    day = as.numeric(difftime(time, min(time), units = "days")),
+    mags = mag - m0
+  )
+
+# ==== Define 3 mesh types ====
+
+# -- Mesh 1: Uniform spacing --
+mesh1 <- fm_mesh_1d(seq(min(eq_m$day), max(eq_m$day), by = 100),
+                    cutoff = 30, degree = 2, boundary = "free")
+
+# -- Mesh 2: KDE-weighted sampling --
+set.seed(42)
+kde <- density(eq_m$day, bw = 200)
+mesh_points2 <- sample(kde$x, size = 120, prob = kde$y, replace = FALSE)
+mesh_points2 <- sort(unique(c(min(eq_m$day), mesh_points2, max(eq_m$day))))
+mesh2 <- fm_mesh_1d(mesh_points2, cutoff = 30, degree = 2, boundary = "free")
+
+# -- Mesh 3: Manually segmented mesh --
+dense1 <- seq(0, 3000, by = 30)
+dense2 <- seq(3000, 7000, by = 70)
+dense3 <- seq(7000, max(eq_m$day), by = 150)
+mesh_points3 <- sort(unique(c(dense1, dense2, dense3)))
+mesh3 <- fm_mesh_1d(mesh_points3, cutoff = 30, degree = 2, boundary = "free")
+
+# ==== Fit function ====
+fit_and_predict <- function(mesh, label) {
+  spde_model <- inla.spde2.pcmatern(
+    mesh,
+    prior.range = c(200, 0.01),
+    prior.sigma = c(0.5, 0.01)
+  )
+  
+  comp <- mags ~ field(day, model = spde_model) + Intercept(1)
+  
+  fit <- bru(
+    components = comp,
+    data = eq_m,
+    family = "exponential",
+    options = list(control.compute = list(dic = TRUE, waic = TRUE))
+  )
+  
+  pred <- predict(fit, data.frame(day = seq(0, max(eq_m$day), by = 20)),
+                  ~ exp(field + Intercept) / log(10), n.samples = 1000)
+  
+  pred$mesh_type <- label
+  return(list(pred = pred, dic = fit$dic$dic, waic = fit$waic$waic))
+}
+
+# ==== Run models ====
+res1 <- fit_and_predict(mesh1, "Uniform mesh")
+res2 <- fit_and_predict(mesh2, "KDE-based mesh")
+res3 <- fit_and_predict(mesh3, "Segmented mesh")
+
+# ==== Combine for plotting ====
+pred_all <- bind_rows(res1$pred, res2$pred, res3$pred)
+
+# ==== Plot ====
+ggplot(pred_all, aes(x = day, y = mean)) +
+  geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
+  geom_line(color = "black") +
+  facet_wrap(~mesh_type, ncol = 1, scales = "free_x") +
+  labs(
+    title = "b-value over time (m0 = 2.5) using different mesh strategies",
+    x = "Days since 1990-01-01", y = "b-value"
+  ) +
+  coord_cartesian(ylim = c(0.3, 1.7)) +
+  theme_minimal(base_size = 12)
+
+# ==== Show model comparison ====
+tibble(
+  Mesh = c("Uniform", "KDE-based", "Segmented"),
+  DIC = c(res1$dic, res2$dic, res3$dic),
+  WAIC = c(res1$waic, res2$waic, res3$waic)
+)
+
+
+################################################################################
+################################################################################
 ##### Try different m0########
-##############################
+################################################################################
+################################################################################
 # ==== Library ====
 library(readr)
 library(dplyr)
@@ -224,11 +645,11 @@ patchwork::wrap_plots(plots, ncol = 2)
 ###### Try m0 = 2.5, 3.5, 4.5#####
 ###################################
 # ==== Libraries ====
+# ==== Libraries ====
 library(readr)
 library(dplyr)
 library(lubridate)
 library(ggplot2)
-library(tidyr)
 library(INLA)
 library(inlabru)
 library(patchwork)
@@ -237,163 +658,7 @@ library(patchwork)
 Sys.setlocale("LC_TIME", "English")
 Sys.setenv(TMPDIR = "D:/R_temp")
 
-# ==== Read combined data ====
-file_path <- "D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv"
-eq_data <- read_csv(file_path) %>%
-  rename(mag = magnitude) %>%
-  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
-  drop_na(time, mag, latitude, longitude)
-
-# ==== Extract mainshocks (m ≥ 6.5, post-1990) ====
-mainshocks_all <- eq_data %>%
-  filter(mag >= 6.5, time >= as.POSIXct("1990-01-01")) %>%
-  arrange(time)
-
-# ==== De-duplicate overlapping mainshocks ====
-window_days <- 60
-lat_window <- 1.5
-lon_window <- 1.5
-
-filtered_mainshocks <- mainshocks_all[1, ]
-for (i in 2:nrow(mainshocks_all)) {
-  new_shock <- mainshocks_all[i, ]
-  overlap <- any(
-    abs(difftime(filtered_mainshocks$time, new_shock$time, units = "days")) <= window_days &
-      abs(filtered_mainshocks$latitude - new_shock$latitude) <= lat_window &
-      abs(filtered_mainshocks$longitude - new_shock$longitude) <= lon_window
-  )
-  if (!overlap) {
-    filtered_mainshocks <- bind_rows(filtered_mainshocks, new_shock)
-  }
-}
-
-# ==== Build sequence list ====
-sequence_list <- list()
-for (i in seq_len(nrow(filtered_mainshocks))) {
-  mainshock <- filtered_mainshocks[i, ]
-  t0 <- mainshock$time
-  lat0 <- mainshock$latitude
-  lon0 <- mainshock$longitude
-  
-  seq_data <- eq_data %>%
-    filter(
-      time >= t0 - days(window_days),
-      time <= t0 + days(window_days),
-      abs(latitude - lat0) <= lat_window,
-      abs(longitude - lon0) <= lon_window
-    )
-  
-  if (nrow(seq_data) > 0) {
-    sequence_list[[i]] <- list(
-      mainshock_time = t0,
-      mainshock_mag = mainshock$mag,
-      sequence_data = seq_data
-    )
-  }
-}
-
-# ==== Modeling for m0 = 2.5, 3.5, 4.5 ====
-m0_list <- c(2.5, 3.5, 4.5)
-plots_by_m0 <- list()
-
-for (m0 in m0_list) {
-  cat("=== Modeling m0 =", m0, "===\n")
-  plot_list <- list()
-  
-  for (i in seq_along(sequence_list)) {
-    seq <- sequence_list[[i]]
-    t0 <- seq$mainshock_time
-    seq_data <- seq$sequence_data %>%
-      filter(mag >= m0) %>%
-      mutate(
-        day = as.numeric(difftime(time, min(time), units = "days")),
-        mags = mag - m0
-      )
-    
-    if (nrow(seq_data) < 50) next  # Skip if data too sparse
-    
-    # Mesh
-    seq_data <- seq_data[order(seq_data$day), ]
-    seq_data$day <- seq_data$day + 0.001
-    extremes <- range(seq_data$day)
-    mesh_points <- seq(extremes[1], extremes[2], by = 5)
-    mesh <- fm_mesh_1d(mesh_points, cutoff = 2, degree = 2, boundary = "free")
-    
-    # SPDE model
-    spde_model <- inla.spde2.pcmatern(
-      mesh,
-      prior.range = c(20, 0.01),
-      prior.sigma = c(0.5, 0.01)
-    )
-    
-    # Fit
-    comp <- mags ~ field(day, model = spde_model) + Intercept(1)
-    
-    fit <- tryCatch({
-      bru(
-        components = comp,
-        data = seq_data,
-        family = "exponential",
-        options = list(control.compute = list(dic = TRUE, waic = TRUE))
-      )
-    }, error = function(e) NULL)
-    
-    if (is.null(fit)) next
-    
-    pred <- predict(fit, data.frame(day = seq(0, max(seq_data$day), by = 0.5)),
-                    ~ exp(field + Intercept) / log(10),
-                    n.samples = 1000)
-    
-    # Plot
-    p <- ggplot(pred, aes(x = day)) +
-      geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
-      geom_line(aes(y = mean), color = "black") +
-      labs(
-        title = paste0("Seq ", i, " | M", round(seq$mainshock_mag, 1),
-                       " @ ", format(t0, "%Y-%m-%d")),
-        x = "Days since mainshock", y = "b-value"
-      ) +
-      theme_minimal(base_size = 10) +
-      coord_cartesian(ylim = c(0.3, 1.7))
-    
-    plot_list[[length(plot_list) + 1]] <- p
-  }
-  
-  plots_by_m0[[as.character(m0)]] <- plot_list
-}
-
-# ==== Display each m0's results in pages of 6 plots ====
-plots_per_page <- 6
-
-for (m0 in names(plots_by_m0)) {
-  plot_list <- plots_by_m0[[m0]]
-  n_pages <- ceiling(length(plot_list) / plots_per_page)
-  cat("\n>>> m0 =", m0, "with", length(plot_list), "plots (", n_pages, "pages)\n")
-  
-  for (page in seq_len(n_pages)) {
-    start_idx <- (page - 1) * plots_per_page + 1
-    end_idx <- min(page * plots_per_page, length(plot_list))
-    page_plots <- wrap_plots(plot_list[start_idx:end_idx], ncol = 2)
-    print(page_plots)
-  }
-}
-
-
-#####
-# Use the whole data of 1990-2021, m0 = 2.5, compare 3 strategies of mesh point
-# ==== Libraries ====
-library(readr)
-library(dplyr)
-library(lubridate)
-library(ggplot2)
-library(INLA)
-library(inlabru)
-
-# ==== Set environment ====
-Sys.setlocale("LC_TIME", "English")
-Sys.setenv(TMPDIR = "D:/R_temp")
-
-# ==== Load data ====
+# ==== Read cleaned data ====
 file_path <- "D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv"
 eq_data <- read_csv(file_path) %>%
   rename(mag = magnitude) %>%
@@ -402,85 +667,110 @@ eq_data <- read_csv(file_path) %>%
   filter(time >= as.POSIXct("1990-01-01"),
          time <= as.POSIXct("2021-12-31"))
 
-# ==== Filter for m0 = 2.5 ====
-m0 <- 2.5
-eq_m <- eq_data %>%
-  filter(mag >= m0) %>%
-  mutate(
-    day = as.numeric(difftime(time, min(time), units = "days")),
-    mags = mag - m0
-  )
+# ==== Define m0 list ====
+m0_list <- c(2.5, 3.5, 4.5)
 
-# ==== Define 3 mesh types ====
+# ==== Store results ====
+fit_results <- list()
+plots <- list()
 
-# -- Mesh 1: Uniform spacing --
-mesh1 <- fm_mesh_1d(seq(min(eq_m$day), max(eq_m$day), by = 100),
-                    cutoff = 30, degree = 2, boundary = "free")
-
-# -- Mesh 2: KDE-weighted sampling --
-set.seed(42)
-kde <- density(eq_m$day, bw = 200)
-mesh_points2 <- sample(kde$x, size = 120, prob = kde$y, replace = FALSE)
-mesh_points2 <- sort(unique(c(min(eq_m$day), mesh_points2, max(eq_m$day))))
-mesh2 <- fm_mesh_1d(mesh_points2, cutoff = 30, degree = 2, boundary = "free")
-
-# -- Mesh 3: Manually segmented mesh --
-dense1 <- seq(0, 3000, by = 30)
-dense2 <- seq(3000, 7000, by = 70)
-dense3 <- seq(7000, max(eq_m$day), by = 150)
-mesh_points3 <- sort(unique(c(dense1, dense2, dense3)))
-mesh3 <- fm_mesh_1d(mesh_points3, cutoff = 30, degree = 2, boundary = "free")
-
-# ==== Fit function ====
-fit_and_predict <- function(mesh, label) {
+# ==== Loop over m0 values ====
+for (m0 in m0_list) {
+  cat(">>> Fitting model with m0 =", m0, "\n")
+  
+  # Filter catalog
+  eq_m <- eq_data %>%
+    filter(mag >= m0) %>%
+    mutate(
+      day = as.numeric(difftime(time, min(time), units = "days")),
+      mags = mag - m0
+    )
+  
+  if (nrow(eq_m) < 100) {
+    message("Skipped m0 = ", m0, " due to insufficient data")
+    next
+  }
+  
+  eq_m <- eq_m[order(eq_m$day), ]
+  eq_m$day <- eq_m$day + 0.001  # avoid 0-day duplication
+  
+  # Create mesh
+  mesh_points <- seq(min(eq_m$day), max(eq_m$day), by = 100)
+  mesh <- fm_mesh_1d(mesh_points, cutoff = 30, degree = 2, boundary = "free")
+  
+  # Define SPDE model
   spde_model <- inla.spde2.pcmatern(
     mesh,
     prior.range = c(200, 0.01),
     prior.sigma = c(0.5, 0.01)
   )
   
+  # Model components
   comp <- mags ~ field(day, model = spde_model) + Intercept(1)
   
-  fit <- bru(
-    components = comp,
-    data = eq_m,
-    family = "exponential",
-    options = list(control.compute = list(dic = TRUE, waic = TRUE))
-  )
+  # Fit model
+  fit <- tryCatch({
+    bru(
+      components = comp,
+      data = eq_m,
+      family = "exponential",
+      options = list(control.compute = list(dic = TRUE, waic = TRUE))
+    )
+  }, error = function(e) {
+    message("❌ Model failed for m0 = ", m0, ": ", e$message)
+    return(NULL)
+  })
   
-  pred <- predict(fit, data.frame(day = seq(0, max(eq_m$day), by = 20)),
-                  ~ exp(field + Intercept) / log(10), n.samples = 1000)
-  
-  pred$mesh_type <- label
-  return(list(pred = pred, dic = fit$dic$dic, waic = fit$waic$waic))
+  if (!is.null(fit)) {
+    pred_df <- predict(fit, data.frame(day = seq(0, max(eq_m$day), by = 20)),
+                       ~ exp(field + Intercept) / log(10), n.samples = 1000)
+    
+    # Store results
+    fit_results[[as.character(m0)]] <- list(
+      m0 = m0,
+      dic = fit$dic$dic,
+      waic = fit$waic$waic,
+      pred = pred_df
+    )
+    
+    # Plot
+    # 获取当前样本数 N
+    N <- nrow(filter(eq_data, mag >= m0))
+    
+    # 绘图
+    p <- ggplot(pred_df, aes(x = day)) +
+      geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
+      geom_line(aes(y = mean), color = "black", size = 1) +
+      labs(
+        title = paste0("b-value over time | m0 = ", m0, " (N = ", N, ")"),
+        y = "b-value", x = "Days since 1990-01-01"
+      ) +
+      ylim(0.3, 1.7) +
+      scale_x_continuous(
+        breaks = seq(0, max(pred_df$day), by = 365 * 5),
+        labels = function(x) format(as.Date("1990-01-01") + x, "%Y")
+      ) +
+      theme_minimal()
+    
+    
+    plots[[as.character(m0)]] <- p
+  }
 }
 
-# ==== Run models ====
-res1 <- fit_and_predict(mesh1, "Uniform mesh")
-res2 <- fit_and_predict(mesh2, "KDE-based mesh")
-res3 <- fit_and_predict(mesh3, "Segmented mesh")
+# ==== Display plots ====
+wrap_plots(plots, ncol = 1)
 
-# ==== Combine for plotting ====
-pred_all <- bind_rows(res1$pred, res2$pred, res3$pred)
+# ==== Summary table ====
+summary_table <- bind_rows(lapply(fit_results, function(res) {
+  tibble(
+    m0 = res$m0,
+    N = nrow(filter(eq_data, mag >= res$m0)),
+    DIC = round(res$dic, 2),
+    WAIC = round(res$waic, 2)
+  )
+})) %>% arrange(m0)
 
-# ==== Plot ====
-ggplot(pred_all, aes(x = day, y = mean)) +
-  geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
-  geom_line(color = "black") +
-  facet_wrap(~mesh_type, ncol = 1, scales = "free_x") +
-  labs(
-    title = "b-value over time (m0 = 2.5) using different mesh strategies",
-    x = "Days since 1990-01-01", y = "b-value"
-  ) +
-  coord_cartesian(ylim = c(0.3, 1.7)) +
-  theme_minimal(base_size = 12)
-
-# ==== Show model comparison ====
-tibble(
-  Mesh = c("Uniform", "KDE-based", "Segmented"),
-  DIC = c(res1$dic, res2$dic, res3$dic),
-  WAIC = c(res1$waic, res2$waic, res3$waic)
-)
+print(summary_table)
 
 
 
@@ -527,8 +817,8 @@ mesh_points_kde <- sort(unique(c(min(df_bru_real$time), mesh_points_kde, max(df_
 mesh_kde <- fm_mesh_1d(mesh_points_kde, degree = 2, boundary = "free")
 
 # ==== 4. Define prior ranges and sigmas ====
-prior_range_list <- round(c(T2/100, T2/50, T2/20, T2/10, T2/5, T2/2, T2/1.5), 1)
-prior_sigma_list <- c(0.1, 0.3, 1, 3, 10)
+prior_range_list <- round(c(T2/1000, T2/100, T2/50, T2/20, T2/10, T2/5, T2/2, T2/1.5), 1)
+prior_sigma_list <- c(0.01, 0.1, 0.3, 1, 3, 10)
 
 # ==== 5. Grid search ====
 results <- tibble(
@@ -592,30 +882,49 @@ results_sorted <- results %>% arrange(DIC)
 print(results_sorted)
 
 # ==== 7. Plot heatmaps ====
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+# === 重新构建绘图数据 ===
 results_heatmap <- results %>%
   mutate(
     range = factor(range, levels = sort(unique(range))),
     sigma = factor(sigma, levels = sort(unique(sigma)))
   )
 
+# === 最优设置（DIC最小） ===
+best_row <- results %>% arrange(DIC) %>% slice(1)
+
+# === DIC 热图 ===
 p_dic <- ggplot(results_heatmap, aes(x = range, y = sigma, fill = DIC)) +
   geom_tile(color = "white") +
   geom_text(aes(label = round(DIC, 1)), size = 3, color = "white") +
+  geom_point(data = best_row, aes(x = factor(range), y = factor(sigma)), 
+             shape = 8, size = 3, color = "cyan") +
   scale_fill_viridis_c(option = "inferno", direction = -1) +
-  labs(title = "DIC across Prior Settings (Real Data, KDE mesh)",
+  labs(title = "DIC across Prior Settings",
        x = "Prior Range", y = "Prior Sigma", fill = "DIC") +
   theme_minimal()
 
+# === WAIC 热图 ===
 p_waic <- ggplot(results_heatmap, aes(x = range, y = sigma, fill = WAIC)) +
   geom_tile(color = "white") +
   geom_text(aes(label = round(WAIC, 1)), size = 3, color = "white") +
+  geom_point(data = best_row, aes(x = factor(range), y = factor(sigma)), 
+             shape = 8, size = 3, color = "cyan") +
   scale_fill_viridis_c(option = "plasma", direction = -1) +
-  labs(title = "WAIC across Prior Settings (Real Data, KDE mesh)",
+  labs(title = "WAIC across Prior Settings",
        x = "Prior Range", y = "Prior Sigma", fill = "WAIC") +
   theme_minimal()
 
-# Display plots
+# === 显示最终组合图 ===
 p_dic / p_waic
+
+
+
+
+
 
 
 ## Use the optimal mesh strategy and prior parameter to fit model with b-value curve
@@ -681,37 +990,97 @@ tibble(
 ################################################################################
 #For each sequence (after 1990), b-value fitting and comparative analysis before and after the main shock were conducted
 ################################################################################
-#Function: Construct KDE-based mesh and fit b-value
-fit_bvalue_segment <- function(df_segment, m0 = 2.5, range_prior = 116.9, sigma_prior = 0.1, min_n = 20) {
+# ==== Required libraries ====
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(tibble)
+library(INLA)
+library(inlabru)
+
+# ==== Read and filter earthquake catalog from 1990 onward ====
+eq_data <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv") %>%
+  rename(mag = magnitude) %>%
+  drop_na(time, mag, latitude, longitude) %>%
+  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
+  filter(time >= as.POSIXct("1990-01-01"))
+
+################################################################################
+# Step 0: Build sequence_list from 1990 onward with spatial & temporal filtering
+################################################################################
+
+mainshocks_all <- eq_data %>%
+  filter(mag >= 6.5) %>%
+  arrange(time)
+
+filtered_mainshocks <- mainshocks_all[1, ]
+for (i in 2:nrow(mainshocks_all)) {
+  new_shock <- mainshocks_all[i, ]
+  overlap <- any(
+    abs(difftime(filtered_mainshocks$time, new_shock$time, units = "days")) <= 60 &
+      abs(filtered_mainshocks$latitude - new_shock$latitude) <= 1.5 &
+      abs(filtered_mainshocks$longitude - new_shock$longitude) <= 1.5
+  )
+  if (!overlap) {
+    filtered_mainshocks <- bind_rows(filtered_mainshocks, new_shock)
+  }
+}
+
+sequence_list <- list()
+for (i in seq_len(nrow(filtered_mainshocks))) {
+  mainshock <- filtered_mainshocks[i, ]
+  t0 <- mainshock$time
+  lat0 <- mainshock$latitude
+  lon0 <- mainshock$longitude
   
-  # 1. Data preprocessing + filtering
-  df_segment <- df_segment %>%
-    filter(mag >= m0) %>%
-    mutate(
-      day = as.numeric(difftime(time, min(time), units = "days")),
-      mags = mag - m0
+  seq_data <- eq_data %>%
+    filter(
+      time >= t0 - days(90),
+      time <= t0 + days(90),
+      abs(latitude - lat0) <= 1.5,
+      abs(longitude - lon0) <= 1.5
     )
   
-  if (nrow(df_segment) < min_n) {
-    cat("❌ Not enough data: ", nrow(df_segment), "\n")
-    return(NULL)
+  if (nrow(seq_data) > 0) {
+    sequence_list[[i]] <- list(
+      mainshock_time = t0,
+      mainshock_mag = mainshock$mag,
+      sequence_data = seq_data
+    )
   }
+}
+
+# Filter sequence_list again (safety) to ensure 1990+
+sequence_list <- Filter(function(seq) seq$mainshock_time >= as.POSIXct("1990-01-01"), sequence_list)
+
+################################################################################
+# For each sequence: b-value fitting and comparative analysis before and after mainshock
+################################################################################
+
+# ==== Function: KDE-based b-value fitting for one segment ====
+fit_bvalue_segment <- function(df_segment, m0 = 2.5, range_prior = 116.9, sigma_prior = 0.1, min_n = 20) {
+  df_segment <- df_segment %>%
+    filter(mag >= m0) %>%
+    mutate(day = as.numeric(difftime(time, min(time), units = "days")),
+           mags = mag - m0)
   
-  # 2. Mesh 
+  if (nrow(df_segment) < min_n) return(NULL)
+  
   kde <- density(df_segment$day, bw = 30)
   mesh_points <- sample(kde$x, size = min(100, length(kde$x)), prob = kde$y, replace = FALSE)
   mesh_points <- sort(unique(c(min(df_segment$day), mesh_points, max(df_segment$day))))
   mesh <- fm_mesh_1d(mesh_points, degree = 2, boundary = "free")
   
-  # 3. SPDE 
   spde <- inla.spde2.pcmatern(
     mesh,
     prior.range = c(range_prior, 0.01),
     prior.sigma = c(sigma_prior, 0.01)
   )
+  
   comp <- mags ~ field(day, model = spde) + Intercept(1)
   
-  # 4. fitting
   fit <- tryCatch({
     bru(
       components = comp,
@@ -719,72 +1088,112 @@ fit_bvalue_segment <- function(df_segment, m0 = 2.5, range_prior = 116.9, sigma_
       family = "exponential",
       options = list(control.compute = list(dic = TRUE, waic = TRUE))
     )
-  }, error = function(e) {
-    cat("❌ Model fitting failed:", conditionMessage(e), "\n")
-    return(NULL)
-  })
+  }, error = function(e) return(NULL))
   
-  if (is.null(fit)) {
-    cat("❌ Fit is NULL\n")
-    return(NULL)
-  }
+  if (is.null(fit)) return(NULL)
   
-  # 5. Prediction + output
   pred <- predict(fit, data.frame(day = seq(0, max(df_segment$day), by = 1)),
                   ~ exp(field + Intercept) / log(10), n.samples = 1000)
   
-  mean_b <- round(mean(pred$mean), 3)
-  low_b <- round(mean(pred$q0.025), 3)
-  high_b <- round(mean(pred$q0.975), 3)
-  
-  cat("✅ Fit success | b =", mean_b, " [", low_b, ",", high_b, "] | n =", nrow(df_segment), "\n")
-  
-  list(pred = pred, mean = mean_b, ci = c(low_b, high_b), n = nrow(df_segment))
+  list(pred = pred,
+       mean = round(mean(pred$mean), 3),
+       ci = round(quantile(pred$mean, c(0.025, 0.975)), 3),
+       n = nrow(df_segment))
 }
 
+# ==== Function: Analyze one mainshock sequence ====
+analyze_sequence_pair <- function(seq, m0 = 2.5, window_days = 90) {
+  t0 <- seq$mainshock_time
+  seq_data <- seq$sequence_data
+  
+  df_before <- seq_data %>% filter(time >= t0 - days(window_days), time < t0)
+  df_after  <- seq_data %>% filter(time > t0, time <= t0 + days(window_days))
+  
+  res_before <- fit_bvalue_segment(df_before, m0 = m0)
+  res_after  <- fit_bvalue_segment(df_after, m0 = m0)
+  
+  if (is.null(res_before) || is.null(res_after)) return(NULL)
+  
+  list(
+    before = res_before,
+    after = res_after,
+    seq = seq,
+    summary = tibble(
+      mainshock_time = t0,
+      mag = seq$mainshock_mag,
+      b_before = res_before$mean,
+      N_before = res_before$n,
+      b_after = res_after$mean,
+      N_after = res_after$n
+    )
+  )
+}
 
-# ==== Main loop: Model all sequences before and after execution and output graphs and tables ====
-results_list <- list()
+# ==== Function: Plot one before/after b-value curve with label ====
+plot_bvalue_segment_split <- function(seq, res_before, res_after) {
+  pred_b <- res_before$pred
+  pred_a <- res_after$pred
+  pred_b$group <- "Before"
+  pred_a$group <- "After"
+  
+  offset <- max(pred_b$day) + 10
+  pred_a$day <- pred_a$day + offset
+  plot_data <- bind_rows(pred_b, pred_a)
+  
+  label_text <- paste0(
+    format(seq$mainshock_time, "%Y-%m-%d"), "\n",
+    "M", round(seq$mainshock_mag, 1), "\n",
+    "b_before = ", res_before$mean, " (N=", res_before$n, ")\n",
+    "b_after  = ", res_after$mean,  " (N=", res_after$n, ")"
+  )
+  
+  ggplot(plot_data, aes(x = day)) +
+    geom_ribbon(aes(ymin = q0.025, ymax = q0.975, fill = group), alpha = 0.2) +
+    geom_line(aes(y = mean, color = group), size = 1.2) +
+    annotate("text", x = min(plot_data$day), y = 1.7, label = label_text,
+             hjust = 0, vjust = 1, fontface = "italic", size = 3.2) +
+    labs(x = "Days since segment start", y = "b-value") +
+    coord_cartesian(ylim = c(0.3, 1.8)) +
+    theme_minimal(base_size = 11) +
+    scale_color_manual(values = c("Before" = "blue", "After" = "red")) +
+    scale_fill_manual(values = c("Before" = "blue", "After" = "red")) +
+    theme(legend.position = "none")
+}
+
+# ==== Main execution block ====
 summary_table <- tibble()
 plot_list <- list()
 
 for (i in seq_along(sequence_list)) {
   seq <- sequence_list[[i]]
-  t0 <- seq$mainshock_time
-  cat("\n==============================\n")
-  cat("▶️ Processing Sequence", i, "| Mainshock:", format(t0, "%Y-%m-%d %H:%M:%S"), "\n")
-  
+  cat("\n▶️ Processing sequence", i, ":", format(seq$mainshock_time, "%Y-%m-%d"), "\n")
   res <- analyze_sequence_pair(seq, m0 = 2.5, window_days = 90)
   
   if (!is.null(res)) {
-    cat("✅ Sequence", i, "successful\n")
+    plot_list[[length(plot_list) + 1]] <- plot_bvalue_segment_split(res$seq, res$before, res$after)
     summary_table <- bind_rows(summary_table, res$summary)
-    plot_list[[length(plot_list) + 1]] <- res$plot
   } else {
-    cat("❌ Sequence", i, "skipped (either before/after failed or insufficient data)\n")
+    cat("❌ Sequence skipped (insufficient data or model failure)\n")
   }
 }
 
-# ==== Print the number of samples before and after each main shock ====
-cat("\n========== Sample Sizes by Sequence ==========\n")
-for (i in seq_along(sequence_list)) {
-  seq <- sequence_list[[i]]
-  t0 <- seq$mainshock_time
-  seq_data <- seq$sequence_data
-  
-  df_before <- seq_data %>% filter(time >= t0 - days(90), time < t0)
-  df_after  <- seq_data %>% filter(time > t0, time <= t0 + days(90))
-  
-  cat(sprintf("🟢 %s | N_before = %d | N_after = %d\n",
-              format(t0, "%Y-%m-%d"),
-              nrow(df_before), nrow(df_after)))
+# ==== Plot and optionally save ====
+plots_per_page <- 6
+n_pages <- ceiling(length(plot_list) / plots_per_page)
+
+for (page in seq_len(n_pages)) {
+  start <- (page - 1) * plots_per_page + 1
+  end <- min(page * plots_per_page, length(plot_list))
+  page_plot <- wrap_plots(plot_list[start:end], ncol = 2)
+  print(page_plot)
+  # Optional: save
+  ggsave(paste0("sequence_page_", page, ".png"), page_plot, width = 10, height = 8, dpi = 300)
 }
 
-# ==== Print the result table and draw graphs ====
-cat("\n========== Summary Table ==========\n")
+# ==== View or export summary ====
 print(summary_table)
+# write_csv(summary_table, "sequence_bvalue_summary.csv")
 
-wrap_plots(plot_list, ncol = 2)
 
 
 
@@ -846,15 +1255,299 @@ ggplot(tidy_bvalues, aes(x = b_value, y = factor(seq_id, levels = rev(unique(seq
   theme_minimal(base_size = 13) +
   xlim(0.5, max(tidy_bvalues$ci_high, na.rm = TRUE) + 0.4)
 
-# ==== Summary trend statistics ====
-## !!We only have 6 sequences!!
-cat("\n===== Summary of b-value Differences (After - Before) =====\n")
 
-mean_diff <- mean(summary_table$diff)
-median_diff <- median(summary_table$diff)
-t_test <- t.test(summary_table$diff)
+################################################################################
+################################################################################
+######b-value covariate modeling: add depth#####################################
+################################################################################
+################################################################################
+# ==== Libraries ====
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(INLA)
+library(inlabru)
 
-cat(sprintf("Mean Δb-value: %.3f\n", mean_diff))
-cat(sprintf("Median Δb-value: %.3f\n", median_diff))
-cat("One-sample t-test against 0:\n")
-print(t_test)
+# ==== Parameters ====
+m0 <- 2.5
+range_prior <- 116.9
+sigma_prior <- 0.1
+
+# ==== Load full catalog data (1990+) ====
+file_path <- "D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv"
+eq_data <- read_csv(file_path) %>%
+  rename(mag = magnitude) %>%
+  drop_na(time, mag, latitude, longitude, depth) %>%
+  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
+  filter(time >= as.POSIXct("1990-01-01"))
+
+# ==== Filter by m0 and prepare variables ====
+eq_m <- eq_data %>%
+  filter(mag >= m0) %>%
+  mutate(
+    day = as.numeric(difftime(time, min(time), units = "days")),
+    mags = mag - m0,
+    depth_scaled = scale(depth)[,1]  # optional: standardized depth
+  )
+
+# ==== Construct mesh on time ====
+mesh <- fm_mesh_1d(seq(min(eq_m$day), max(eq_m$day), by = 100), 
+                   cutoff = 30, degree = 2, boundary = "free")
+
+# ==== Define SPDE model ====
+spde_model <- inla.spde2.pcmatern(
+  mesh,
+  prior.range = c(range_prior, 0.01),
+  prior.sigma = c(sigma_prior, 0.01)
+)
+
+# ==== Model components: add depth as linear covariate ====
+comp <- mags ~ Intercept(1) + depth_scaled + field(day, model = spde_model)
+
+# ==== Fit the model ====
+fit <- bru(
+  components = comp,
+  data = eq_m,
+  family = "exponential",
+  options = list(control.compute = list(dic = TRUE, waic = TRUE, config = TRUE))
+)
+
+# ==== Posterior summaries ====
+summary(fit)
+
+# ==== Extract posterior of beta_depth ====
+depth_post <- fit$marginals.fixed$depth_scaled
+
+# Plot posterior of depth coefficient
+plot(depth_post, type = "l", xlab = expression(beta[depth]), ylab = "Density", main = "Posterior of Depth Effect")
+abline(v = inla.emarginal(identity, depth_post), col = "red", lty = 2)
+
+# Print posterior mean and 95% CI
+depth_mean <- inla.emarginal(identity, depth_post)
+depth_ci <- inla.qmarginal(c(0.025, 0.975), depth_post)
+cat("\nPosterior beta_depth:")
+cat("\n  Mean     :", round(depth_mean, 4))
+cat("\n  95% CI   :", round(depth_ci, 4), "\n")
+
+# ==== Optionally visualize b-value over time (marginalized over depth) ====
+pred_time <- data.frame(day = seq(0, max(eq_m$day), by = 20), depth_scaled = 0)
+
+pred <- predict(fit, pred_time, ~ exp(field + Intercept) / log(10), n.samples = 1000)
+
+ggplot(pred, aes(x = day)) +
+  geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
+  geom_line(aes(y = mean), color = "black", size = 1) +
+  labs(title = "b-value over time (m0 = 2.5, with depth covariate)",
+       x = "Days since 1990-01-01", y = "b-value") +
+  coord_cartesian(ylim = c(0.3, 1.7)) +
+  theme_minimal()
+
+###########
+#for each sequence
+# ==== Libraries ====
+library(readr)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(tibble)
+library(INLA)
+library(inlabru)
+library(tidyr)
+library(stringr)
+
+# ==== Function: KDE-based b-value fitting for one segment with depth ====
+fit_bvalue_segment <- function(df_segment, m0 = 2.5, range_prior = 116.9, sigma_prior = 0.1, min_n = 20) {
+  df_segment <- df_segment %>%
+    filter(mag >= m0) %>%
+    drop_na(depth) %>%
+    mutate(
+      day = as.numeric(difftime(time, min(time), units = "days")),
+      mags = mag - m0,
+      depth_scaled = scale(depth)[, 1]
+    )
+  
+  if (nrow(df_segment) < min_n) return(NULL)
+  
+  kde <- density(df_segment$day, bw = 30)
+  mesh_points <- sample(kde$x, size = min(100, length(kde$x)), prob = kde$y, replace = FALSE)
+  mesh_points <- sort(unique(c(min(df_segment$day), mesh_points, max(df_segment$day))))
+  mesh <- fm_mesh_1d(mesh_points, degree = 2, boundary = "free")
+  
+  spde <- inla.spde2.pcmatern(
+    mesh,
+    prior.range = c(range_prior, 0.01),
+    prior.sigma = c(sigma_prior, 0.01)
+  )
+  
+  comp <- mags ~ field(day, model = spde) + depth_scaled + Intercept(1)
+  
+  fit <- tryCatch({
+    bru(
+      components = comp,
+      data = df_segment,
+      family = "exponential",
+      options = list(control.compute = list(dic = TRUE, waic = TRUE, config = TRUE))
+    )
+  }, error = function(e) return(NULL))
+  
+  if (is.null(fit)) return(NULL)
+  
+  pred <- predict(fit, data.frame(day = seq(0, max(df_segment$day), by = 1), depth_scaled = 0),
+                  ~ exp(field + Intercept) / log(10), n.samples = 1000)
+  
+  ci <- round(quantile(pred$mean, c(0.025, 0.975)), 3)
+  
+  list(
+    pred = pred,
+    mean = round(mean(pred$mean), 3),
+    ci = paste0("[", ci[1], ", ", ci[2], "]"),
+    n = nrow(df_segment)
+  )
+}
+
+# ==== Function: Analyze one mainshock sequence ====
+analyze_sequence_pair <- function(seq, m0 = 2.5, window_days = 90) {
+  t0 <- seq$mainshock_time
+  seq_data <- seq$sequence_data
+  
+  df_before <- seq_data %>% filter(time >= t0 - days(window_days), time < t0)
+  df_after  <- seq_data %>% filter(time > t0, time <= t0 + days(window_days))
+  
+  res_before <- fit_bvalue_segment(df_before, m0 = m0)
+  res_after  <- fit_bvalue_segment(df_after, m0 = m0)
+  
+  if (is.null(res_before) || is.null(res_after)) return(NULL)
+  
+  list(
+    before = res_before,
+    after = res_after,
+    seq = seq,
+    summary = tibble(
+      mainshock = seq$mainshock_time,
+      mag = seq$mainshock_mag,
+      b_before = res_before$mean,
+      ci_before = res_before$ci,
+      N_before = res_before$n,
+      b_after = res_after$mean,
+      ci_after = res_after$ci,
+      N_after = res_after$n,
+      diff = round(res_after$mean - res_before$mean, 3)
+    )
+  )
+}
+
+# ==== Function: Plot one before/after b-value curve with label ====
+plot_bvalue_segment_split <- function(seq, res_before, res_after) {
+  pred_b <- res_before$pred
+  pred_a <- res_after$pred
+  pred_b$group <- "Before"
+  pred_a$group <- "After"
+  
+  offset <- max(pred_b$day) + 10
+  pred_a$day <- pred_a$day + offset
+  plot_data <- bind_rows(pred_b, pred_a)
+  
+  label_text <- paste0(
+    format(seq$mainshock_time, "%Y-%m-%d"), "\n",
+    "M", round(seq$mainshock_mag, 1), "\n",
+    "b_before = ", res_before$mean, " (N=", res_before$n, ")\n",
+    "b_after  = ", res_after$mean,  " (N=", res_after$n, ")"
+  )
+  
+  ggplot(plot_data, aes(x = day)) +
+    geom_ribbon(aes(ymin = q0.025, ymax = q0.975, fill = group), alpha = 0.2) +
+    geom_line(aes(y = mean, color = group), size = 1.2) +
+    annotate("text", x = min(plot_data$day), y = 1.7, label = label_text,
+             hjust = 0, vjust = 1, fontface = "italic", size = 3.2) +
+    labs(x = "Days since segment start", y = "b-value") +
+    coord_cartesian(ylim = c(0.3, 1.8)) +
+    theme_minimal(base_size = 11) +
+    scale_color_manual(values = c("Before" = "blue", "After" = "red")) +
+    scale_fill_manual(values = c("Before" = "blue", "After" = "red")) +
+    theme(legend.position = "none")
+}
+
+# ==== Main execution block ====
+summary_table <- tibble()
+plot_list <- list()
+
+for (i in seq_along(sequence_list)) {
+  seq <- sequence_list[[i]]
+  cat("\n▶️ Processing sequence", i, ":", format(seq$mainshock_time, "%Y-%m-%d"), "\n")
+  res <- analyze_sequence_pair(seq, m0 = 2.5, window_days = 90)
+  
+  if (!is.null(res)) {
+    plot_list[[length(plot_list) + 1]] <- plot_bvalue_segment_split(res$seq, res$before, res$after)
+    summary_table <- bind_rows(summary_table, res$summary)
+  } else {
+    cat("❌ Sequence skipped (insufficient data or model failure)\n")
+  }
+}
+
+# ==== Plot and optionally save ====
+plots_per_page <- 6
+n_pages <- ceiling(length(plot_list) / plots_per_page)
+
+for (page in seq_len(n_pages)) {
+  start <- (page - 1) * plots_per_page + 1
+  end <- min(page * plots_per_page, length(plot_list))
+  page_plot <- wrap_plots(plot_list[start:end], ncol = 2)
+  print(page_plot)
+  ggsave(paste0("sequence_page_depth_", page, ".png"), page_plot, width = 10, height = 8, dpi = 300)
+}
+
+# ==== Summary plot with horizontal error bars ====
+tidy_bvalues <- summary_table %>%
+  mutate(seq_id = paste0("Seq ", row_number(), " @ ", substr(mainshock, 1, 10))) %>%
+  rowwise() %>%
+  mutate(
+    before_low = as.numeric(str_extract(ci_before, "(?<=\\[)[^,]+")),
+    before_high = as.numeric(str_extract(ci_before, "(?<=, )[^\\]]+")),
+    after_low = as.numeric(str_extract(ci_after, "(?<=\\[)[^,]+")),
+    after_high = as.numeric(str_extract(ci_after, "(?<=, )[^\\]]+"))
+  ) %>%
+  select(seq_id, b_before, before_low, before_high,
+         b_after, after_low, after_high, diff) %>%
+  pivot_longer(
+    cols = c(b_before, b_after),
+    names_to = "group", values_to = "b_value"
+  ) %>%
+  mutate(
+    group = ifelse(group == "b_before", "Before", "After"),
+    ci_low = ifelse(group == "Before", before_low, after_low),
+    ci_high = ifelse(group == "Before", before_high, after_high)
+  ) %>%
+  select(seq_id, group, b_value, ci_low, ci_high, diff)
+
+diff_labels <- tidy_bvalues %>%
+  filter(group == "After") %>%
+  mutate(
+    label = paste0("Δ=", round(diff, 2)),
+    y = factor(seq_id, levels = rev(unique(tidy_bvalues$seq_id)))
+  )
+
+p_diff <- ggplot(tidy_bvalues, aes(x = b_value, y = factor(seq_id, levels = rev(unique(seq_id))), color = group)) +
+  geom_point(position = position_dodge(width = 0.5), size = 2) +
+  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.25,
+                 position = position_dodge(width = 0.5)) +
+  geom_text(data = diff_labels,
+            aes(x = b_value + 0.05, y = y, label = label),
+            inherit.aes = FALSE,
+            color = "black", size = 3.5, hjust = 0) +
+  scale_color_manual(values = c("Before" = "blue", "After" = "red")) +
+  labs(
+    title = "Comparison of b-values Before and After Mainshocks (with depth)",
+    x = "b-value",
+    y = "Mainshock Sequence",
+    color = "Group"
+  ) +
+  theme_minimal(base_size = 13) +
+  xlim(0.5, max(tidy_bvalues$ci_high, na.rm = TRUE) + 0.4)
+
+print(p_diff)
+
+# ==== View or export summary ====
+print(summary_table)
+# write_csv(summary_table, "sequence_bvalue_depth_summary.csv")
