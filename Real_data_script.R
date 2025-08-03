@@ -1,260 +1,259 @@
-# Isolate different sequences (m≥6.5) 
-# ==== Load libraries ====
+
+
+#####################
+#Plot for background###
+#####################
+
+
+#######
+#Real data GR-law example
+# 加载库
+library(ggplot2)
 library(readr)
 library(dplyr)
-library(tidyr)
+
+# 读取真实数据
+data <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv")
+
+# 设置震级下限（M0）
+M0 <- 2.5
+
+# 选取非缺失并满足 M >= M0 的震级
+mags_values <- data %>% 
+  filter(!is.na(magnitude), magnitude >= M0) %>% 
+  pull(magnitude)
+
+# 创建震级分箱（bins）
+mags_bins <- seq(M0, max(mags_values), by = 0.1)
+
+# 计算累计频率 N(M)
+mags_counts <- vapply(mags_bins, \(bin) sum(mags_values >= bin), 0)
+
+# 计算 log10 N(M)
+log_counts <- log10(mags_counts)
+
+# 拟合线性模型
+fit <- lm(log_counts ~ mags_bins)
+slope <- coef(fit)[2]
+b_value_est <- abs(round(slope, 3))
+line_value <- predict(fit)
+
+# 绘图
+ggplot() +
+  geom_point(aes(x = mags_bins, y = log_counts), size = 2) +
+  geom_line(aes(x = mags_bins, y = line_value), color = "red") +
+  labs(
+    title = "Log-Frequency Plot of Earthquake Magnitudes",
+    subtitle = paste0("Linear fit slope = ", round(slope, 3), " → b ≈ ", b_value_est),
+    x = "Magnitude",
+    y = expression(log[10](N(M)))
+  ) +
+  theme_minimal(base_size = 14)
+
+##############################
+#####Gaussian process beta(t)
+##############################
 library(lubridate)
+library(dplyr)
+library(inlabru)
+library(INLA)
 library(ggplot2)
-library(patchwork)
-Sys.setlocale("LC_TIME", "English")#Manually set the language environment
 
-# ==== Read and clean the data ====
-file_path <- "D:/project data/MSc_Data_Science_Project/earthquakes.csv"
-eq_data <- read_csv(file_path)
+# 读取数据
+data <- read.csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv")
 
-eq_data <- eq_data %>%
-  rename(mag = magnitude) %>%
-  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
-  drop_na(time, mag, latitude, longitude)
-
-# ==== Extract the main shocks with m≥6.5 ====
-mainshocks <- eq_data %>%
-  filter(mag >= 6.5) %>%
-  arrange(time)
-
-# ==== Set the windows ====
-window_days <- 60
-lat_window <- 1.5
-lon_window <- 1.5
-
-# ==== Extract the sequence and generate the graph ====
-sequence_list <- list()
-plot_list <- list()
-
-for (i in seq_len(nrow(mainshocks))) {
-  mainshock <- mainshocks[i, ]
-  t0 <- mainshock$time
-  lat0 <- mainshock$latitude
-  lon0 <- mainshock$longitude
-  
-  seq_data <- eq_data %>%
-    filter(
-      time >= t0 - days(window_days),
-      time <= t0 + days(window_days),
-      abs(latitude - lat0) <= lat_window,
-      abs(longitude - lon0) <= lon_window
-    )
-  
-  sequence_list[[i]] <- list(
-    mainshock_time = t0,
-    mainshock_mag = mainshock$mag,
-    sequence_data = seq_data
+# 预处理
+data_clean <- data %>%
+  filter(magnitude >= 2.5) %>%
+  mutate(
+    time = ymd_hms(time),
+    time_numeric = year(time) + yday(time) / 365.25  # 连续时间变量
   )
-  
-  # Subplot: Magnitude vs. Time
-  p <- ggplot(seq_data, aes(x = time, y = mag)) +
-    geom_point(color = "orange", alpha = 0.7) +
-    geom_vline(xintercept = as.numeric(t0), color = "red", linetype = "dashed") +
-    labs(
-      title = paste0("Sequence ", i, " | M", round(mainshock$mag, 1),
-                     " @ ", format(t0, "%Y-%m-%d")),
-      x = "Time", y = "Magnitude"
-    ) +
-    theme_minimal(base_size = 10)
-  
-  plot_list[[i]] <- p
-}
 
-# ==== Combine all subplots ====
-combined_plot <- wrap_plots(plot_list, ncol = 2)  
-
-# ==== Show combined plot ====
-print(combined_plot)
-
-
-## Use the whole data 2008-2021, modify the mesh points according to density 
-# ==== Library ====
-library(readr)       
-library(dplyr)        
-library(tidyr)        
-library(lubridate)    
-library(ggplot2)      
-library(patchwork)    
-library(INLA)        
-library(inlabru)      
-
-# ==== Set the English time display ====
-Sys.setlocale("LC_TIME", "English")
-
-# ==== Read and clean the data ====
-file_path <- "D:/project data/MSc_Data_Science_Project/earthquakes.csv"
-eq_data <- read_csv(file_path)
-
-eq_data <- eq_data %>%
-  rename(mag = magnitude) %>%
-  mutate(time = as.POSIXct(time, tz = "UTC")) %>%
-  drop_na(time, mag, latitude, longitude)
-
-# ==== Select time（2008–2021）====
-eq_filtered <- eq_data %>%
-  filter(time >= as.POSIXct("2008-01-01"),
-         time <= as.POSIXct("2021-12-31"))
-
-# ==== Convert the time to "days" ====
-start_time <- min(eq_filtered$time)
-eq_filtered <- eq_filtered %>%
-  mutate(day = as.numeric(difftime(time, start_time, units = "days")),
-         mags = mag - 2.5)  # Convert to residual magnitude
-
-
-# ==== Create mesh（time） ====
-mesh1D <- fm_mesh_1d(eq_filtered$day, cutoff = 30, degree = 2, boundary = "free")
-
-# ==== SPDE ====
-spde_model <- inla.spde2.pcmatern(
-  mesh1D,
-  prior.range = c(200, 0.01),     # Change to optimal combination later
-  prior.sigma = c(0.5, 0.01)
+# 构建一维时间 mesh
+time_range <- range(data_clean$time_numeric)
+time_mesh <- inla.mesh.1d(
+  seq(time_range[1], time_range[2], length.out = 100)
 )
 
-# ==== Fitting ====
-comp <- mags ~ field(day, model = spde_model) + Intercept(1)
+# SPDE 模型
+spde_time <- inla.spde2.pcmatern(
+  mesh = time_mesh,
+  prior.range = c(0.5, 0.9),  # 平滑程度：P(range < 0.5) = 0.1
+  prior.sigma = c(1, 0.01)    # 振幅控制
+)
+
+# 定义组件
+cmp <- ~ Intercept(1, model = "linear") +
+  beta_field(time_numeric, model = spde_time)
+
+
+# 自定义对数似然函数
+loglike <- function(beta, data, M0 = 2.5) {
+  sum(log(beta) - beta * (data$magnitude - M0))
+}
+
+# 拟合公式（事件的数量看作 point process）
+bru_formula <- magnitude ~ Intercept + beta_field
+
+# 构建 inlabru likelihood
+lik <- like(
+  formula = bru_formula,
+  family = "exponential",
+  data = data_clean,
+  control.family = list(
+    control.link = list(model = "log")
+  )
+)
 
 fit <- bru(
-  components = comp,
-  data = eq_filtered,
+  formula = bru_formula,
+  components = cmp,
+  data = data_clean,
   family = "exponential",
-  options = list(control.compute = list(dic = TRUE, waic = TRUE))
+  control.family = list(control.link = list(model = "log")),
+  options = list(verbose = TRUE)
 )
 
-# ==== Prediction & Plotting ====
-time_pred <- data.frame(day = seq(0, max(eq_filtered$day), by = 20))
 
-pred <- predict(fit, time_pred, ~ exp(field + Intercept) / log(10), n.samples = 1000)
 
-ggplot() +
-  geom_ribbon(data = pred, aes(x = day, ymin = q0.025, ymax = q0.975), fill = "grey80") +
-  geom_line(data = pred, aes(x = day, y = mean), color = "black") +
+# 构造 prediction time points
+pred_time <- data.frame(time_numeric = seq(time_range[1], time_range[2], length.out = 300))
+
+# 预测 log β(t)
+pred <- predict(fit, pred_time, ~ Intercept + beta_field, n.samples = 1000)
+
+library(ggplot2)
+
+ggplot(pred, aes(x = time_numeric)) +
+  geom_line(aes(y = mean), color = "blue") +
+  geom_ribbon(aes(ymin = q0.025, ymax = q0.975), alpha = 0.2, fill = "skyblue") +
   labs(
-    title = "b-value over time (2008–2021)",
-    x = "Days since 2008-01-01", y = "b-value"
+    title = expression(Temporal~evolution~of~log~beta(t)),
+    x = "Time (year)",
+    y = expression(log~beta(t))
   ) +
+  xlim(1920, 2023) +
   theme_minimal()
 
-## It seems the model did not converge, so we try different m0
 
-#######
-install.packages("INLA", repos = c(getOption("repos"),
-                                   INLA = "https://inla.r-inla-download.org/R/stable"), dep = TRUE)
-system.file("bin/windows/64bit/inla.exe", package = "INLA")
-#######
-
-
-## Use data 2008-2021, try different m0
-# ==== Library ====
-library(readr)
+##############################
+#####Gaussian process beta(s)
+##############################
 library(dplyr)
-library(lubridate)
-library(ggplot2)
-library(tidyr)
 library(INLA)
-options(inla.call = "remote") 
 library(inlabru)
+library(ggplot2)
+library(maps)
 
-# ==== Set the English month ====
-# ==== Set environment ====
-Sys.setlocale("LC_TIME", "English")                      
-Sys.setenv(TMPDIR = "D:/R_temp")                         # Avoid INLA temporary file issues
+# 读取数据
+data <- read.csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv")
 
-# ==== Read and preprocess the data ====
-file_path <- "D:/project data/MSc_Data_Science_Project/earthquakes.csv"
-eq_data <- read_csv(file_path) |> 
-  rename(mag = magnitude) |> 
-  mutate(time = as.POSIXct(time, tz = "UTC")) |> 
-  drop_na(time, mag, latitude, longitude) |> 
-  filter(time >= as.POSIXct("2008-01-01"), time <= as.POSIXct("2021-12-31"))
+# 筛选可靠数据：M >= 2.5 且经纬度不为空
+data_clean <- data %>%
+  filter(magnitude >= 2.5, !is.na(latitude), !is.na(longitude)) %>%
+  mutate(x = longitude, y = latitude)
 
-# ==== list of m0 thresholds ====
-m0_list <- c(2.5)#, 2.8, 3.0, 3.2)
-fit_results <- list()
+# 生成空间 mesh（基于震中）
+coords <- cbind(data_clean$x, data_clean$y)
 
-# ==== Loop modeling different m0 ====
-for (m0 in m0_list) {
-  cat(">>> Fitting model with m0 =", m0, "\n")
+mesh <- inla.mesh.2d(
+  loc = coords,
+  max.edge = c(0.5, 5),  # 视数据稠密程度而定，可调整
+  cutoff = 0.2,
+  offset = c(1, 2)
+)
+
+# 构建 SPDE model
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  prior.range = c(1, 0.01),    # P(range < 1 deg) = 0.01
+  prior.sigma = c(1, 0.01)     # P(sigma > 1) = 0.01
+)
+
+# 组件命名为 "spatial_field"
+cmp <- ~ Intercept(1, model = "linear") +
+  spatial_field(coordinates, model = spde)
+
+# 公式
+formula <- magnitude ~ Intercept + spatial_field
+
+# 定义坐标数据（用于匹配 SPDE 的空间索引）
+data_clean$coordinates <- coords
+
+# 拟合：对 magnitude 建模（作为 proxy for log β(s)）
+fit <- bru(
+  formula = formula,
+  components = cmp,
+  data = data_clean,
+  family = "exponential",  # 或其它近似分布，模拟 GR 模型对 β 的推断
+  control.family = list(control.link = list(model = "log")),
+  options = list(verbose = TRUE)
+)
+
+# 创建覆盖所有观测点的经纬度网格
+grid_res <- 100
+x_range <- range(data_clean$x)
+y_range <- range(data_clean$y)
+
+pred_grid <- expand.grid(
+  x = seq(x_range[1], x_range[2], length.out = grid_res),
+  y = seq(y_range[1], y_range[2], length.out = grid_res)
+)
+
+pred_grid$coordinates <- cbind(pred_grid$x, pred_grid$y)
+
+# 预测 log β(s)
+pred <- predict(fit, pred_grid, ~ Intercept + spatial_field, n.samples = 1000)
+
+# 可视化：热图 + 地震点
+# 获取美国地图数据
+usa_map <- map_data("state")
+
+# 仅保留 California
+california_map <- subset(usa_map, region == "california")
+ggplot() +
+  # 热图
+  geom_tile(data = pred, aes(x = x, y = y, fill = mean)) +
   
-  eq_m <- eq_data %>%
-    filter(mag > m0) %>%
-    mutate(
-      day = as.numeric(difftime(time, min(time), units = "days")),
-      mags = mag - m0
-    )
-  eq_m<- as.data.frame(eq_m)
-  eq_m$day =eq_m$day + 0.001
-  eq_m <- eq_m[order(eq_m$day),]
-  # mesh_points <- seq(start_day, end_day, by = 100)
-  extremes = range(eq_m$day)
-  mesh_points <- seq(extremes[1], extremes[2], by = 100)
-  mesh <- fm_mesh_1d(mesh_points, cutoff = 30, degree = 2, boundary = "free")
+  # 地震点（点型图例）
+  geom_point(
+    data = data_clean,
+    aes(x = x, y = y, shape = "Earthquake Epicenter"),
+    color = "black", alpha = 0.3, size = 0.5
+  ) +
   
-  spde_model <- inla.spde2.pcmatern(
-    mesh,
-    prior.range = c(200, 0.01),## Change to the optimal combination later
-    prior.sigma = c(0.5, 0.01)
+  # 加州边界线（线型图例）
+  geom_path(
+    data = california_map,
+    aes(x = long, y = lat, group = group, linetype = "California Border"),
+    color = "black", size = 0.5
+  ) +
+  
+  # 色标图例
+  scale_fill_viridis_c(option = "plasma", name = expression(log~beta(s))) +
+  
+  # 设置 shape 图例
+  scale_shape_manual(name = "", values = c("Earthquake Epicenter" = 16)) +
+  
+  # 设置 linetype 图例
+  scale_linetype_manual(name = "", values = c("California Border" = "solid")) +
+  
+  # 明确将 shape 和 linetype 图例分离管理
+  guides(
+    shape = guide_legend(override.aes = list(size = 2, alpha = 1)),
+    linetype = guide_legend(override.aes = list(size = 1))
+  ) +
+  
+  labs(
+    title = expression("Posterior mean of " * log~beta(s)),
+    x = "Longitude", y = "Latitude"
+  ) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
   )
-  
-  comp <- mags ~ field(day, model = spde_model) + Intercept(1)
-  
-  fit <- tryCatch({
-    bru(
-      components = comp,
-      data = eq_m,
-      family = "exponential",
-      options = list(control.compute = list(dic = TRUE, waic = TRUE, return.marginals = TRUE))
-    )
-  }, error = function(e) {
-    message("Failed for m0 = ", m0, " | ", e$message)
-    return(NULL)
-  })
-  
-  if (!is.null(fit)) {
-    pred_df <- predict(fit, data.frame(day = seq(0, max(eq_m$day), by = 20)),
-                       ~ exp(field + Intercept) / log(10),
-                       n.samples = 1000)
-    
-    fit_results[[as.character(m0)]] <- list(
-      m0 = m0,
-      dic = fit$dic$dic,
-      waic = fit$waic$waic,
-      pred = pred_df
-    )
-  }
-}
-
-# ==== Summary table ====
-summary_table <- bind_rows(lapply(fit_results, function(res) {
-  tibble(
-    m0 = res$m0,
-    DIC = round(res$dic, 2),
-    WAIC = round(res$waic, 2)
-  )
-})) |> arrange(DIC)
-
-print(summary_table)
-
-# ==== Visualize the prediction curves of different M0 ====
-plots <- list()
-for (i in seq_along(fit_results)) {
-  m0 <- names(fit_results)[i]
-  pred <- fit_results[[i]]$pred
-  p <- ggplot(pred, aes(x = day)) +
-    geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
-    geom_line(aes(y = mean), color = "black", size = 1) +
-    labs(title = paste("m0 =", m0), y = "b-value", x = "days since 2008-01-01") +
-    ylim(0.3, 1.7)
-  plots[[m0]] <- p
-}
-
-patchwork::wrap_plots(plots, ncol = 2)
-
-
 
