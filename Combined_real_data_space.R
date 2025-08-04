@@ -155,8 +155,8 @@ mesh <- inla.mesh.2d(
 )
 
 # ==== 5. 可视化 ====
-plot(mesh, main = "KDE-weighted Mesh")
-points(eq_filtered$x, eq_filtered$y, col = rgb(0, 0, 0, 0.1), pch = 16, cex = 0.3)
+#plot(mesh, main = "KDE-weighted Mesh")
+#points(eq_filtered$x, eq_filtered$y, col = rgb(0, 0, 0, 0.1), pch = 16, cex = 0.3)
 
 # ==== 3. 设置 Prior 网格 ====
 x_range <- diff(range(eq_filtered$x))
@@ -374,34 +374,80 @@ fit <- bru(
 summary(fit)
 
 # ==== 5. 构建预测网格（KDE非均匀采样） ====
+# 从 sample_pool 中按 KDE 权重采样预测点
+# 采样预测点
 pred_pool <- sample_n(sample_pool, size = 5000, weight = weight)
-# 修复 coord 列：构造成矩阵列
-pred_pool$coord <- I(cbind(pred_pool$x, pred_pool$y))
 
+# 构造空间矩阵
+coords_pred <- as.matrix(pred_pool[, c("x", "y")])
 
-# ==== 6. 空间预测 ====
-pred <- predict(fit, pred_pool, ~ exp(field_spatial + Intercept) / log(10), n.samples = 1000)
+# 执行预测
+pred <- predict(fit,
+                formula = ~ exp(field_spatial + Intercept) / log(10),
+                newdata = list(coord = coords_pred),
+                n.samples = 1000)
+
 
 # ==== 7. 可视化：b-value map ====
-ggplot(pred, aes(x = x, y = y, fill = mean)) +
-  geom_point(shape = 15, size = 1.2) +
-  coord_fixed() +
-  scale_fill_viridis_c(name = "b-value", limits = c(0.4, 1.6)) +
+library(ggplot2)
+library(viridis)
+
+# 添加坐标信息
+pred_df <- data.frame(
+  x = coords_pred[, 1],
+  y = coords_pred[, 2],
+  b_mean = pred$mean,
+  b_sd = pred$sd,
+  b_lower = pred$q0.025,
+  b_upper = pred$q0.975
+)
+
+# b-value 平均值图
+ggplot(pred_df, aes(x = x, y = y, fill = b_mean)) +
+  geom_tile() +
+  coord_equal() +
+  scale_fill_viridis_c(option = "plasma", name = "b-value") +
   labs(
-    title = "Spatial b-value map (KDE-weighted mesh)",
-    x = "Standardized Longitude", y = "Standardized Latitude"
+    title = "Posterior Mean of Spatial b-value",
+    x = "x (scaled longitude)", y = "y (scaled latitude)"
   ) +
   theme_minimal()
 
-# ==== 8. 可视化：不确定性 map ====
-pred$width <- pred$q0.975 - pred$q0.025
-
-ggplot(pred, aes(x = x, y = y, fill = width)) +
-  geom_point(shape = 15, size = 1.2) +
-  coord_fixed() +
-  scale_fill_viridis_c(option = "magma", name = "Posterior width") +
+# spatial uncertainty map
+ggplot(pred_df, aes(x = x, y = y, fill = b_sd)) +
+  geom_tile() +
+  coord_equal() +
+  scale_fill_viridis_c(option = "magma", name = "Posterior SD") +
   labs(
-    title = "Uncertainty of b-value prediction",
-    x = "Standardized Longitude", y = "Standardized Latitude"
+    title = "Posterior Uncertainty of b-value (Standard Deviation)",
+    x = "x (scaled longitude)", y = "y (scaled latitude)"
   ) +
   theme_minimal()
+
+#95% Credible Interval Width map
+pred_df$ci_width <- pred_df$b_upper - pred_df$b_lower
+
+ggplot(pred_df, aes(x = x, y = y, fill = ci_width)) +
+  geom_tile() +
+  coord_equal() +
+  scale_fill_viridis_c(option = "inferno", name = "95% CI Width") +
+  labs(
+    title = "Credible Interval Width for b-value",
+    x = "x (scaled longitude)", y = "y (scaled latitude)"
+  ) +
+  theme_minimal()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
