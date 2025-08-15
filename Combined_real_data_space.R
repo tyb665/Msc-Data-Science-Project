@@ -386,66 +386,85 @@ pred <- predict(fit,
                 n.samples = 1000)
 
 
-# ==== 7. visual：b-value map ====
+# ==== 7. visual：b-value map（反标准化 + 加州边界）====
 library(ggplot2)
 library(viridis)
+library(maps)
+library(dplyr)
 
-# coordinates information
+# —— 1) 反标准化回经纬度 —— 
+# 注意：这里用 eq_filtered 中原始经纬度的均值和标准差来反标准化
+lon_mean <- mean(eq_filtered$longitude, na.rm = TRUE)
+lon_sd   <- sd(eq_filtered$longitude, na.rm = TRUE)
+lat_mean <- mean(eq_filtered$latitude,  na.rm = TRUE)
+lat_sd   <- sd(eq_filtered$latitude,  na.rm = TRUE)
+
 pred_df <- data.frame(
   x = coords_pred[, 1],
   y = coords_pred[, 2],
-  b_mean = pred$mean,
-  b_sd = pred$sd,
+  b_mean  = pred$mean,
+  b_sd    = pred$sd,
   b_lower = pred$q0.025,
   b_upper = pred$q0.975
-)
+) %>%
+  mutate(
+    longitude = x * lon_sd + lon_mean,
+    latitude  = y * lat_sd + lat_mean,
+    ci_width  = b_upper - b_lower
+  )
 
-# b-value mean value map
-ggplot(pred_df, aes(x = x, y = y, fill = b_mean)) +
-  geom_tile() +
-  coord_equal() +
+# —— 2) 加州边界数据（行政边界/海岸线）——
+usa_map <- map_data("state")
+california_map <- subset(usa_map, region == "california")
+
+# —— 3) 画图：b值后验均值 —— 
+p_mean <- ggplot() +
+  geom_tile(data = pred_df,
+            aes(x = longitude, y = latitude, fill = b_mean)) +
+  geom_path(data = california_map,
+            aes(x = long, y = lat, group = group, linetype = "California Border"),
+            color = "black", linewidth = 0.5) +
   scale_fill_viridis_c(option = "plasma", name = "b-value") +
+  coord_fixed() +
   labs(
     title = "Posterior Mean of Spatial b-value",
-    x = "x (scaled longitude)", y = "y (scaled latitude)"
+    x = "Longitude", y = "Latitude"
   ) +
   theme_minimal()
 
-# spatial uncertainty map
-ggplot(pred_df, aes(x = x, y = y, fill = b_sd)) +
-  geom_tile() +
-  coord_equal() +
+# —— 4) 画图：后验标准差（不确定性）——
+p_sd <- ggplot() +
+  geom_tile(data = pred_df,
+            aes(x = longitude, y = latitude, fill = b_sd)) +
+  geom_path(data = california_map,
+            aes(x = long, y = lat, group = group, linetype = "California Border"),
+            color = "black", linewidth = 0.5) +
   scale_fill_viridis_c(option = "magma", name = "Posterior SD") +
+  coord_fixed() +
   labs(
-    title = "Posterior Uncertainty of b-value (Standard Deviation)",
-    x = "x (scaled longitude)", y = "y (scaled latitude)"
+    title = "Posterior Uncertainty of b-value (SD)",
+    x = "Longitude", y = "Latitude"
   ) +
   theme_minimal()
 
-#95% Credible Interval Width map
-pred_df$ci_width <- pred_df$b_upper - pred_df$b_lower
-
-ggplot(pred_df, aes(x = x, y = y, fill = ci_width)) +
-  geom_tile() +
-  coord_equal() +
+# —— 5) 画图：95%置信区间宽度 —— 
+p_ci <- ggplot() +
+  geom_tile(data = pred_df,
+            aes(x = longitude, y = latitude, fill = ci_width)) +
+  geom_path(data = california_map,
+            aes(x = long, y = lat, group = group, linetype = "California Border"),
+            color = "black", linewidth = 0.5) +
   scale_fill_viridis_c(option = "inferno", name = "95% CI Width") +
+  coord_fixed() +
   labs(
     title = "Credible Interval Width for b-value",
-    x = "x (scaled longitude)", y = "y (scaled latitude)"
+    x = "Longitude", y = "Latitude"
   ) +
   theme_minimal()
 
-
-
-
-
-
-
-
-
-
-
-
-
+# 打印或按需拼图
+print(p_mean)
+print(p_sd)
+print(p_ci)
 
 
