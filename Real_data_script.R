@@ -7,38 +7,37 @@
 
 #######
 #Real data GR-law example
-# 加载库
 library(ggplot2)
 library(readr)
 library(dplyr)
 
-# 读取真实数据
+# read data
 data <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv")
 
-# 设置震级下限（M0）
+# Set the lower limit of the seismic magnitude (M0)
 M0 <- 2.5
 
-# 选取非缺失并满足 M >= M0 的震级
+# Select the seismic magnitude that is non-missing and satisfies M >= M0
 mags_values <- data %>% 
   filter(!is.na(magnitude), magnitude >= M0) %>% 
   pull(magnitude)
 
-# 创建震级分箱（bins）
+# Create magnitude bins
 mags_bins <- seq(M0, max(mags_values), by = 0.1)
 
-# 计算累计频率 N(M)
+# Calculate the cumulative frequency N(M)
 mags_counts <- vapply(mags_bins, \(bin) sum(mags_values >= bin), 0)
 
-# 计算 log10 N(M)
+# Calculate log10 N(M)
 log_counts <- log10(mags_counts)
 
-# 拟合线性模型
+# Fit the linear model
 fit <- lm(log_counts ~ mags_bins)
 slope <- coef(fit)[2]
 b_value_est <- abs(round(slope, 3))
 line_value <- predict(fit)
 
-# 绘图
+# Plot
 ggplot() +
   geom_point(aes(x = mags_bins, y = log_counts), size = 2) +
   geom_line(aes(x = mags_bins, y = line_value), color = "red") +
@@ -59,10 +58,10 @@ library(inlabru)
 library(INLA)
 library(ggplot2)
 
-# 读取数据
+# Read data
 data <- read.csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv")
 
-# 预处理
+# Preprocessing
 data_clean <- data %>%
   filter(magnitude >= 2.5) %>%
   mutate(
@@ -70,33 +69,33 @@ data_clean <- data %>%
     time_numeric = year(time) + yday(time) / 365.25  # 连续时间变量
   )
 
-# 构建一维时间 mesh
+# Construct a one-dimensional temporal mesh
 time_range <- range(data_clean$time_numeric)
 time_mesh <- inla.mesh.1d(
   seq(time_range[1], time_range[2], length.out = 100)
 )
 
-# SPDE 模型
+# SPDE model
 spde_time <- inla.spde2.pcmatern(
   mesh = time_mesh,
-  prior.range = c(0.5, 0.9),  # 平滑程度：P(range < 0.5) = 0.1
-  prior.sigma = c(1, 0.01)    # 振幅控制
+  prior.range = c(0.5, 0.9),  # Smoothness: P(range < 0.5) = 0.1
+  prior.sigma = c(1, 0.01)    
 )
 
-# 定义组件
+# Define components
 cmp <- ~ Intercept(1, model = "linear") +
   beta_field(time_numeric, model = spde_time)
 
 
-# 自定义对数似然函数
+# Define log-likelihood function
 loglike <- function(beta, data, M0 = 2.5) {
   sum(log(beta) - beta * (data$magnitude - M0))
 }
 
-# 拟合公式（事件的数量看作 point process）
+# Fitting (the number of events is regarded as point process)
 bru_formula <- magnitude ~ Intercept + beta_field
 
-# 构建 inlabru likelihood
+# Construct inlabru likelihood
 lik <- like(
   formula = bru_formula,
   family = "exponential",
@@ -117,24 +116,39 @@ fit <- bru(
 
 
 
-# 构造 prediction time points
+# ---------- Prediction: transform to b-value(t) ----------
+# Construct prediction time points
 pred_time <- data.frame(time_numeric = seq(time_range[1], time_range[2], length.out = 300))
 
-# 预测 log β(t)
-pred <- predict(fit, pred_time, ~ Intercept + beta_field, n.samples = 1000)
+# predict: return the posterior statistic of the expression we provided
+# Here the log beta (t) - > beta (t) = exp (log beta (t)), again into b (t) = beta (t)/ln (10)
+pred_b <- predict(
+  fit,
+  pred_time,
+  ~ exp(Intercept + beta_field) / log(10),  
+  n.samples = 1000
+)
 
+# For readability, give the columns a name (mean/sd/ quantile column names remain the default in inlabru)
+names(pred_b)[names(pred_b) == "mean"]   <- "b_mean"
+names(pred_b)[names(pred_b) == "sd"]     <- "b_sd"
+names(pred_b)[names(pred_b) == "q0.025"] <- "b_q0.025"
+names(pred_b)[names(pred_b) == "q0.975"] <- "b_q0.975"
+
+# ---------- Plot b(t) ----------
 library(ggplot2)
 
-ggplot(pred, aes(x = time_numeric)) +
-  geom_line(aes(y = mean), color = "blue") +
-  geom_ribbon(aes(ymin = q0.025, ymax = q0.975), alpha = 0.2, fill = "skyblue") +
+ggplot(pred_b, aes(x = time_numeric)) +
+  geom_line(aes(y = b_mean), color = "blue") +
+  geom_ribbon(aes(ymin = b_q0.025, ymax = b_q0.975), alpha = 0.2, fill = "skyblue") +
   labs(
-    title = expression(Temporal~evolution~of~log~beta(t)),
+    title = expression(Temporal~evolution~of~b(t)),
     x = "Time (year)",
-    y = expression(log~beta(t))
+    y = expression(b(t))
   ) +
-  xlim(1920, 2023) +
+  xlim(1932, 2022) +   
   theme_minimal()
+
 
 
 ##############################
@@ -146,53 +160,53 @@ library(inlabru)
 library(ggplot2)
 library(maps)
 
-# 读取数据
+# read data
 data <- read.csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv")
 
-# 筛选可靠数据：M >= 2.5 且经纬度不为空
+# Filter reliable data: M >= 2.5 and the longitude and latitude are not empty
 data_clean <- data %>%
   filter(magnitude >= 2.5, !is.na(latitude), !is.na(longitude)) %>%
   mutate(x = longitude, y = latitude)
 
-# 生成空间 mesh（基于震中）
+# Generate spatial mesh (based on the epicenter)
 coords <- cbind(data_clean$x, data_clean$y)
 
 mesh <- inla.mesh.2d(
   loc = coords,
-  max.edge = c(0.5, 5),  # 视数据稠密程度而定，可调整
+  max.edge = c(0.5, 5),  # It can be adjusted depending on the density of the data
   cutoff = 0.2,
   offset = c(1, 2)
 )
 
-# 构建 SPDE model
+# Construct SPDE model
 spde <- inla.spde2.pcmatern(
   mesh = mesh,
   prior.range = c(1, 0.01),    # P(range < 1 deg) = 0.01
   prior.sigma = c(1, 0.01)     # P(sigma > 1) = 0.01
 )
 
-# 组件命名为 "spatial_field"
+# Define component as "spatial_field"
 cmp <- ~ Intercept(1, model = "linear") +
   spatial_field(coordinates, model = spde)
 
-# 公式
+# formula
 formula <- magnitude ~ Intercept + spatial_field
 
-# 定义坐标数据（用于匹配 SPDE 的空间索引）
+# Define coordinate data (for matching the spatial index of SPDE)
 data_clean$coordinates <- coords
 
-# 拟合：对 magnitude 建模（作为 proxy for log β(s)）
+# Fitting: Modeling magnitude (as proxy for log β(s))
 fit <- bru(
   formula = formula,
   components = cmp,
   data = data_clean,
-  family = "exponential",  # 或其它近似分布，模拟 GR 模型对 β 的推断
+  family = "exponential",  
   control.family = list(control.link = list(model = "log")),
   options = list(verbose = TRUE)
 )
 
-# 创建覆盖所有观测点的经纬度网格
-grid_res <- 100
+# ---------- Prediction: transform to b-value(s) ----------
+# Create a longitude and latitude grid covering the observation range (grid_res can be tuned according to performance)
 x_range <- range(data_clean$x)
 y_range <- range(data_clean$y)
 
@@ -200,53 +214,55 @@ pred_grid <- expand.grid(
   x = seq(x_range[1], x_range[2], length.out = grid_res),
   y = seq(y_range[1], y_range[2], length.out = grid_res)
 )
-
 pred_grid$coordinates <- cbind(pred_grid$x, pred_grid$y)
 
-# 预测 log β(s)
-pred <- predict(fit, pred_grid, ~ Intercept + spatial_field, n.samples = 1000)
+# Perform the transformation directly in the expression of predict：b(s) = exp(Intercept + spatial_field) / log(10)
+pred_b <- predict(
+  fit,
+  pred_grid,
+  ~ exp(Intercept + spatial_field) / log(10),
+  n.samples = 1000
+)
 
-# 可视化：热图 + 地震点
-# 获取美国地图数据
+# Change to a clearer column name
+names(pred_b)[names(pred_b) == "mean"]   <- "b_mean"
+names(pred_b)[names(pred_b) == "sd"]     <- "b_sd"
+names(pred_b)[names(pred_b) == "q0.025"] <- "b_q0.025"
+names(pred_b)[names(pred_b) == "q0.975"] <- "b_q0.975"
+
+# ---------- Plot b(s) ----------
 usa_map <- map_data("state")
-
-# 仅保留 California
 california_map <- subset(usa_map, region == "california")
+
 ggplot() +
-  # 热图
-  geom_tile(data = pred, aes(x = x, y = y, fill = mean)) +
+  # Heat map (posterior mean of b(s))
+  geom_tile(data = pred_b, aes(x = x, y = y, fill = b_mean)) +
   
-  # 地震点（点型图例）
+  # Shock points
   geom_point(
     data = data_clean,
     aes(x = x, y = y, shape = "Earthquake Epicenter"),
     color = "black", alpha = 0.3, size = 0.5
   ) +
   
-  # 加州边界线（线型图例）
+  # The border of California
   geom_path(
     data = california_map,
     aes(x = long, y = lat, group = group, linetype = "California Border"),
-    color = "black", size = 0.5
+    color = "black", linewidth = 0.5
   ) +
   
-  # 色标图例
-  scale_fill_viridis_c(option = "plasma", name = expression(log~beta(s))) +
-  
-  # 设置 shape 图例
+  # Color codes and legends
+  scale_fill_viridis_c(option = "plasma", name = expression(b(s))) +
   scale_shape_manual(name = "", values = c("Earthquake Epicenter" = 16)) +
-  
-  # 设置 linetype 图例
   scale_linetype_manual(name = "", values = c("California Border" = "solid")) +
-  
-  # 明确将 shape 和 linetype 图例分离管理
   guides(
     shape = guide_legend(override.aes = list(size = 2, alpha = 1)),
-    linetype = guide_legend(override.aes = list(size = 1))
+    linetype = guide_legend(override.aes = list(linewidth = 1))
   ) +
   
   labs(
-    title = expression("Posterior mean of " * log~beta(s)),
+    title = expression("Posterior mean of " * b(s)),
     x = "Longitude", y = "Latitude"
   ) +
   coord_fixed() +
@@ -257,3 +273,94 @@ ggplot() +
     legend.text = element_text(size = 9)
   )
 
+################################################################
+########Distribution of magnitude on time and space########
+################################################################
+# =========================
+# Time vs Magnitude (Intro)
+# =========================
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+
+df <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv", show_col_types = FALSE) %>%
+  mutate(time = ymd_hms(time, quiet = TRUE),
+         date = as.Date(time)) %>%
+  filter(!is.na(date), !is.na(magnitude))
+
+tmin <- as.Date("1932-01-01")
+tmax <- as.Date("2022-12-31")
+M0  <- 2.5
+
+# Calculate the annotation position: 92% on the right side, slightly above the dotted line
+x_lab <- tmin + round(as.numeric(tmax - tmin) * 0.92)
+y_lab <- M0 + 0.12
+
+p_bin <- ggplot(df, aes(x = date, y = magnitude)) +
+  geom_bin2d(binwidth = c(365.25, 0.1)) +
+  scale_fill_viridis_c(
+    trans = "log10",
+    name = "Count\n(log scale)",
+    guide = guide_colorbar(barheight = unit(60, "pt"))
+  ) +
+  # White dotted line (M0)
+  geom_hline(yintercept = M0, linetype = "dashed", color = "white", linewidth = 0.6) +
+  annotate("label",
+           x = x_lab, y = y_lab,
+           label = sprintf("M0 = %.1f", M0),
+           label.size = 0,
+           fill = alpha("black", 0.35),
+           colour = "white", size = 3.8) +
+  labs(
+    title = "Earthquake magnitudes over time",
+    subtitle = "dashed line shows M0 = 2.5",
+    x = "Year", y = "Magnitude"
+  ) +
+  scale_x_date(
+    limits = c(tmin, tmax),
+    date_breaks = "10 years",
+    date_labels = "%Y",
+    expand = c(0.01, 0.01)
+  ) +
+  coord_cartesian(ylim = range(df$magnitude, na.rm = TRUE)) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+
+p_bin
+
+#################################################
+# Space vs magnitude
+#################################################
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(viridisLite)  
+library(maps)
+
+# data
+df <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv", show_col_types = FALSE) |>
+  filter(!is.na(latitude), !is.na(longitude), !is.na(magnitude), magnitude >= 2.5) |>
+  mutate(x = longitude, y = latitude)
+
+usa_map <- map_data("state")
+ca_map  <- subset(usa_map, region == "california")
+
+# Hexagonal density (bins can be fine-tuned as needed)
+p_hex <- ggplot(df, aes(x = x, y = y)) +
+  geom_hex(bins = 70) +
+  scale_fill_viridis_c(trans = "log10", name = "Count\n(log scale)") +
+  geom_point(data = df[sample.int(nrow(df), min(3000, nrow(df))), ],
+             aes(x = x, y = y), color = "black", alpha = 0.15, size = 0.2) +
+  geom_path(data = ca_map, aes(x = long, y = lat, group = group),
+            color = "black", linewidth = 0.5) +
+  labs(
+    title = "Spatial distribution of seismicity (M ≥ 2.5)",
+    x = "Longitude", y = "Latitude"
+  ) +
+  coord_quickmap() +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+
+p_hex
