@@ -119,7 +119,7 @@ coords <- dplyr::select(eq_filtered, x, y)
 
 # ==== 1. KDE estimated density + contour boundary ====
 kde <- kde2d(eq_filtered$x, eq_filtered$y, n = 200)
-contour_level <- quantile(kde$z, 0.3)  # 可调密度阈值
+contour_level <- quantile(kde$z, 0.3)  # Adjustable density threshold
 contour_lines <- contourLines(kde$x, kde$y, kde$z, levels = contour_level)
 boundary_coords <- cbind(contour_lines[[1]]$x, contour_lines[[1]]$y)
 
@@ -130,14 +130,14 @@ boundary <- inla.nonconvex.hull(boundary_coords, convex = -0.03)
 library(MASS)
 kde <- kde2d(eq_filtered$x, eq_filtered$y, n = 200)
 
-# ==== 2. 构建 KDE-based 采样点池 ====
+# ==== 2. Construct a KDE-based sampling point pool ====
 x_vec <- rep(kde$x, each = length(kde$y))
 y_vec <- rep(kde$y, times = length(kde$x))
 z_vec <- as.vector(kde$z)
 
 # Build a dataframe and remove low-density points
 sample_pool <- data.frame(x = x_vec, y = y_vec, weight = z_vec) %>%
-  filter(weight > quantile(weight, 0.05))  # 可调阈值
+  filter(weight > quantile(weight, 0.05))  # adjustable
 
 # Sampling mesh points (the greater the density, the higher the weight)
 set.seed(42)
@@ -206,7 +206,7 @@ for (r in prior_range_list) {
         )
       )
     }, error = function(e) {
-      message("❌ Fit failed: ", e$message)
+      message("Fit failed: ", e$message)
       return(NULL)
     })
     
@@ -386,14 +386,13 @@ pred <- predict(fit,
                 n.samples = 1000)
 
 
-# ==== 7. visual：b-value map（反标准化 + 加州边界）====
+# ==== 7. visual：b-value map====
 library(ggplot2)
 library(viridis)
 library(maps)
 library(dplyr)
 
-# —— 1) 反标准化回经纬度 —— 
-# 注意：这里用 eq_filtered 中原始经纬度的均值和标准差来反标准化
+# —— 1) back to standard longitude and latitude —— 
 lon_mean <- mean(eq_filtered$longitude, na.rm = TRUE)
 lon_sd   <- sd(eq_filtered$longitude, na.rm = TRUE)
 lat_mean <- mean(eq_filtered$latitude,  na.rm = TRUE)
@@ -413,11 +412,11 @@ pred_df <- data.frame(
     ci_width  = b_upper - b_lower
   )
 
-# —— 2) 加州边界数据（行政边界/海岸线）——
+# —— 2) California Boundary Data (Administrative Boundaries/Coastline)——
 usa_map <- map_data("state")
 california_map <- subset(usa_map, region == "california")
 
-# —— 3) 画图：b值后验均值 —— 
+# —— 3) Plot: The posterior mean of value b —— 
 p_mean <- ggplot() +
   geom_tile(data = pred_df,
             aes(x = longitude, y = latitude, fill = b_mean)) +
@@ -432,7 +431,7 @@ p_mean <- ggplot() +
   ) +
   theme_minimal()
 
-# —— 4) 画图：后验标准差（不确定性）——
+# —— 4) Plot: Posterior standard deviation (Uncertainty)——
 p_sd <- ggplot() +
   geom_tile(data = pred_df,
             aes(x = longitude, y = latitude, fill = b_sd)) +
@@ -447,7 +446,7 @@ p_sd <- ggplot() +
   ) +
   theme_minimal()
 
-# —— 5) 画图：95%置信区间宽度 —— 
+# —— 5) Plot: Width of the 95% confidence interval —— 
 p_ci <- ggplot() +
   geom_tile(data = pred_df,
             aes(x = longitude, y = latitude, fill = ci_width)) +
@@ -462,7 +461,7 @@ p_ci <- ggplot() +
   ) +
   theme_minimal()
 
-# 打印或按需拼图
+# Print
 print(p_mean)
 print(p_sd)
 print(p_ci)
@@ -472,48 +471,48 @@ print(p_ci)
 ################################################################################
 #Consider the covariates depths########################################
 ################################################################################
-# ==== 0. 加载库 ====
+# ==== 0. libraries ====
 library(INLA)
 library(inlabru)
 library(dplyr)
 library(tidyr)
 
-# ==== 1. 读取和预处理数据 ====
+# ==== 1. Read and preprocess data ====
 eq_data <- read.csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv")
 
 eq_filtered <- eq_data %>%
   filter(!is.na(magnitude), magnitude >= 2.5,
          !is.na(longitude), !is.na(latitude), !is.na(depth)) %>%
   mutate(
-    mags        = magnitude - 2.5,                           # 震级减去 M0，作为响应变量
-    x           = as.numeric(scale(longitude)[,1]),          # 经度标准化
-    y           = as.numeric(scale(latitude)[,1]),           # 纬度标准化
-    depth_s     = as.numeric(scale(depth)[,1]),              # 深度标准化
-    coordinates = cbind(x, y)                                # 坐标矩阵
+    mags        = magnitude - 2.5,                           # The magnitude minus M0 is taken as the response variable
+    x           = as.numeric(scale(longitude)[,1]),          # Longitude standardization
+    y           = as.numeric(scale(latitude)[,1]),           # Latitude standardization
+    depth_s     = as.numeric(scale(depth)[,1]),              # Depth standardization
+    coordinates = cbind(x, y)                                # Coordinates matrix
   )
 
-# ==== 2. 构建 Mesh ====
+# ==== 2. Construct Mesh ====
 library(MASS)
 
-# Step 1: KDE 估计密度
+# Step 1: KDE density estimation
 kde <- kde2d(eq_filtered$x, eq_filtered$y, n = 200)
 
-# Step 2: 构建采样池（剔除低密度区域）
+# Step 2: Build a sampling pool (excluding low-density areas)
 x_vec <- rep(kde$x, each = length(kde$y))
 y_vec <- rep(kde$y, times = length(kde$x))
 z_vec <- as.vector(kde$z)
 
 sample_pool <- data.frame(x = x_vec, y = y_vec, weight = z_vec) %>%
-  filter(weight > quantile(weight, 0.05))   # 可调阈值
+  filter(weight > quantile(weight, 0.05))   # Adjustable threshold
 
-# Step 3: 加权采样 mesh 点
+# Step 3: Weighted sampling mesh points
 set.seed(2024)
 mesh_points <- sample_n(sample_pool, size = 800, weight = weight)
 
-# Step 4: 非凸边界（保持加州轮廓）
+# Step 4: Non-convex boundaries (maintaining the outline of California)
 boundary <- inla.nonconvex.hull(as.matrix(eq_filtered[, c("x", "y")]), convex = -0.03)
 
-# Step 5: 构建 mesh
+# Step 5: Construct mesh
 mesh <- inla.mesh.2d(
   loc = mesh_points[, c("x", "y")],
   boundary = boundary,
@@ -522,46 +521,45 @@ mesh <- inla.mesh.2d(
 )
 
 
-# ==== 3. 定义两个 SPDE 模型 ====
-# 已有 mesh 的前提下
+# ==== 3. Define two SPDE models ====
 spde0 <- inla.spde2.pcmatern(mesh, prior.range = c(0.26, 0.01), prior.sigma = c(0.30, 0.01))
 spde1 <- inla.spde2.pcmatern(mesh, prior.range = c(0.26, 0.01), prior.sigma = c(0.20, 0.01))
 
-# 构建投影矩阵
+# Construct the projection matrix
 A0 <- inla.spde.make.A(mesh, loc = eq_filtered$coordinates)
 A1 <- inla.spde.make.A(mesh, loc = eq_filtered$coordinates, weights = eq_filtered$depth_s)
 
 
-# ==== 4. 定义模型组件（mapper 自动实现变系数）====
+# ==== 4. Define model components (mapper automatically implements variable coefficients)====
 components <- ~ Intercept(1) +
   depth_lin(depth_s, model = "linear") +
   field0(coordinates, model = spde0) +
   field1(coordinates, model = spde1)
 
-# ==== 5. 定义似然函数 ====
+# ==== 5. Define the likelihood function ====
 likelihood <- like(
   formula = mags ~ Intercept + depth_lin + field0 + field1,
   family  = "exponential",
   data    = eq_filtered
 )
 
-# ==== 6. 拟合模型 ====
+# ==== 6. Fitting model ====
 fit_vc <- bru(
   components = components,
   likelihood = likelihood,
   options = list(
-    bru_initialisation = list(A = list(A0, A1)),  # ✅ 正确方式：显式传入两个场的投影矩阵
+    bru_initialisation = list(A = list(A0, A1)),  # Pass in the projection matrices of the two fields
     control.compute = list(dic = TRUE, waic = TRUE, config = TRUE),
     control.inla = list(int.strategy = "eb")
   )
 )
 
-# ==== 7. 拟合结果摘要 ====
+# ==== 7. Summary of fitting ====
 summary(fit_vc)
 
 ##Prediction and visualization
 # ===============================
-# 预测 + 可视化（含变系数与深浅对比）——修正版
+# Prediction + Visualization (including variable coefficients and depth comparison) 
 # ===============================
 library(INLA)
 library(inlabru)
@@ -570,7 +568,7 @@ library(ggplot2)
 library(viridis)
 library(maps)
 
-# ---- 0) 反标准化经纬度 + 底图 ----
+# ---- 0) standardized longitude and latitude ----
 lon_mean <- mean(eq_filtered$longitude, na.rm = TRUE)
 lon_sd   <- sd(eq_filtered$longitude, na.rm = TRUE)
 lat_mean <- mean(eq_filtered$latitude,  na.rm = TRUE)
@@ -601,7 +599,7 @@ plot_raster <- function(df, fill_col, title_txt, fill_name, option = "plasma") {
     theme_minimal()
 }
 
-# ---- 1) 预测点：优先用 KDE 样本池，否则规则网格 ----
+# ---- 1) Prediction point: preferred kde sample pool, otherwise the regular grid----
 if (exists("sample_pool") && all(c("x","y") %in% names(sample_pool))) {
   set.seed(2024)
   pred_points <- dplyr::sample_n(sample_pool, size = 5000, weight = weight)
@@ -615,20 +613,20 @@ if (exists("sample_pool") && all(c("x","y") %in% names(sample_pool))) {
   coords_pred <- as.matrix(grid[, c("x","y")])
 }
 
-# ---- 2) 生成 A 矩阵（注意 field1 需要 depth 权重） ----
+# ---- 2) Generate A matrix(Note that field1 requires a depth weight)----
 make_pred_As <- function(coords_pred, depth_s_vec) {
   A0_pred <- INLA::inla.spde.make.A(mesh, loc = coords_pred)                         # field0
   A1_pred <- INLA::inla.spde.make.A(mesh, loc = coords_pred, weights = depth_s_vec) # field1 * depth
   list(A0_pred = A0_pred, A1_pred = A1_pred)
 }
 
-# ---- 3) 统一预测函数（关键修改：newdata 里变量名必须叫 depth_s；公式用 '+ depth_lin'） ----
+# ---- 3) Unified Prediction Function (Key modification: The variable name in newdata must be depth_s; the formula should be '+ depth_lin')----
 predict_b <- function(depth_s_vec, nsamp = 1000) {
   stopifnot(length(depth_s_vec) == nrow(coords_pred))
   As <- make_pred_As(coords_pred, depth_s_vec)
   pred <- predict(
     fit_vc,
-    # depth_lin 会自动用 newdata$depth_s 乘系数；field1 的乘法由 A1 的 weights 完成
+    # depth_lin will automatically multiply the coefficient with newdata$depth_s; The multiplication of field1 is accomplished by the weights of A1
     ~ exp(Intercept + depth_lin + field0 + field1) / log(10),
     newdata = list(coordinates = coords_pred, depth_s = depth_s_vec),
     A = list(As$A0_pred, As$A1_pred),
@@ -643,7 +641,7 @@ predict_b <- function(depth_s_vec, nsamp = 1000) {
   )
 }
 
-# ---- 4) 情景 A：代表性深度（中位数） ----
+# ---- 4) Scenario A: Representativeness Depth (median) ----
 depth_rep <- median(eq_filtered$depth_s, na.rm = TRUE)
 pred_rep  <- predict_b(rep(depth_rep, nrow(coords_pred)), nsamp = 1000) %>% lonlat_back()
 pred_rep$ci_width <- pred_rep$b_upper - pred_rep$b_lower
@@ -654,9 +652,9 @@ p_rep_ci   <- plot_raster(pred_rep, "ci_width","95% CI Width of b (depth = media
 
 print(p_rep_mean); print(p_rep_sd); print(p_rep_ci)
 
-# ---- 5) 情景 B：浅层 vs 深层 对比 + Δb ----
+# ---- 5) Scenario B: Shallow vs. deep contrast + Δb ----
 q_shallow <- as.numeric(quantile(eq_filtered$depth_s, 0.25, na.rm = TRUE))
-q_deep    <- as.numeric(quantile(eq_filtered$depth_s, 0.75, na.rm = TRUE))  # 可改 0.90
+q_deep    <- as.numeric(quantile(eq_filtered$depth_s, 0.75, na.rm = TRUE))  # We can change as 0.90
 
 pred_shallow <- predict_b(rep(q_shallow, nrow(coords_pred)), nsamp = 1000) %>% lonlat_back()
 pred_deep    <- predict_b(rep(q_deep,    nrow(coords_pred)), nsamp = 1000) %>% lonlat_back()
@@ -669,7 +667,7 @@ p_deepmap <- plot_raster(pred_deep, "b_mean",
                          "b-value", "plasma")
 print(p_shallow); print(p_deepmap)
 
-# Δb：深层 − 浅层
+# Δb：deep − shallow
 delta <- left_join(
   pred_deep, pred_shallow,
   by = c("x", "y", "longitude", "latitude"),
@@ -677,7 +675,7 @@ delta <- left_join(
 ) %>%
   mutate(
     db_mean = b_mean_deep - b_mean_shallow,
-    # 置信区间显著性判断
+    # Significance judgment of confidence intervals
     sig_neg = (b_upper_deep < b_lower_shallow),
     sig_pos = (b_lower_deep > b_upper_shallow)
   )
@@ -687,8 +685,8 @@ p_db <- plot_raster(delta, "db_mean",
                     "Δb = b(deep) − b(shallow)", "Δb", "cividis")
 print(p_db)
 
-# ---- 6) 情景 C：深度效应强度（空间变系数） map ----
-# 让 depth_s = 1，则 depth_lin + field1 就是 log β 对 depth_s 的单位斜率
+# ---- 6) Scenario C: Depth Effect Intensity (spatial variable coefficient) map----
+# Let depth_s = 1, then depth_lin + field1 is the unit slope of log β versus depth_s
 depth_one  <- rep(1, nrow(coords_pred))
 As_slope   <- make_pred_As(coords_pred, depth_s_vec = depth_one)
 pred_slope <- predict(
