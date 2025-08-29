@@ -273,6 +273,9 @@ ggplot() +
     legend.text = element_text(size = 9)
   )
 
+
+
+#The section below created the picture for introduction
 ################################################################
 ########Distribution of magnitude on time and space########
 ################################################################
