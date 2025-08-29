@@ -1,9 +1,9 @@
-########## Space modeling
 library(readr)
 library(dplyr)
 library(ggplot2)
 library(lubridate)
 library(tidyr)
+library(maps)
 
 # ==== read data ====
 file_path <- "D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv"
@@ -30,10 +30,35 @@ eq_filtered <- eq_filtered %>%
     mags = mag - m0
   )
 
-# ==== Visualization of epicentral distribution====
-ggplot(eq_filtered, aes(x = longitude, y = latitude)) +
-  geom_point(alpha = 0.3, size = 0.6) +
+# ==== 加州边界数据 ====
+states <- map_data("state")
+california <- states %>% filter(region == "california")
+
+# ==== 画图 ====
+ggplot() +
+  # 边界线 + 图例
+  geom_polygon(data = california,
+               aes(x = long, y = lat, group = group, linetype = "California boundary"),
+               fill = NA, color = "black", size = 0.6) +
+  
+  # 地震点（原样）
+  geom_point(data = eq_filtered,
+             aes(x = longitude, y = latitude),
+             alpha = 0.3, size = 0.6) +
+  
   coord_fixed() +
+  scale_linetype_manual(values = c("California boundary" = "solid"),
+                        name = "",  # 图例标题为空
+                        guide = guide_legend(override.aes = list(color = "black"))) +
+  geom_point(data = eq_filtered, aes(x = longitude, y = latitude, color = mag), alpha = 0, size = 0) +
+
+  
+  # 颜色图例（但不参与实际绘图）
+  scale_color_gradient(
+    low = "gray80", high = "black",
+    name = "Magnitude"
+  ) +
+  
   labs(title = paste("Earthquakes ≥", m0, "since 1990"),
        x = "Longitude", y = "Latitude") +
   theme_minimal()
@@ -93,6 +118,189 @@ mesh <- inla.mesh.2d(
 # ==== Visualize Mesh ====
 plot(mesh, asp = 1, main = "Spatial Mesh (KDE-based)")
 points(coords$x, coords$y, col = rgb(0,0,0,0.1), pch = 16, cex = 0.3)
+
+
+################################################################################
+## Spatial b-value modeling: KDE-based mesh + QC + inlabru fit with CPO/PIT  ##
+################################################################################
+
+## ---- Libraries ----
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(INLA)
+  library(inlabru)
+  library(MASS)
+  library(sp)
+})
+
+## ---- Reproducibility ----
+set.seed(42)
+
+## ---- Inputs: eq_filtered is assumed ready with columns longitude, latitude, mag ----
+## Example (if you need a filter): eq_filtered <- eq_data %>% filter(mag >= m0)
+## Here we assume m0 already defined in your workspace
+if (!exists("eq_filtered")) stop("eq_filtered not found. Please prepare eq_filtered first.")
+if (!exists("m0")) stop("m0 not found. Please define m0 (magnitude of completeness).")
+
+## ---- Coordinates & pre-processing ----
+eq_filtered <- eq_filtered %>%
+  mutate(
+    x    = scale(longitude)[, 1],
+    y    = scale(latitude)[, 1],
+    mags = mag - m0
+  )
+
+coords <- dplyr::select(eq_filtered, x, y)
+
+## ---- KDE estimate of spatial density (for sampling mesh points) ----
+kde <- MASS::kde2d(coords$x, coords$y, n = 200)
+
+# Vectorize KDE grid
+x_vec <- rep(kde$x, each = length(kde$y))
+y_vec <- rep(kde$y, times = length(kde$x))
+z_vec <- as.vector(kde$z)
+
+# Remove very low-density pixels to avoid remote points
+threshold  <- quantile(z_vec, 0.05, na.rm = TRUE)
+valid_idx  <- which(z_vec > threshold)
+sample_pool <- data.frame(
+  x = x_vec[valid_idx],
+  y = y_vec[valid_idx],
+  weight = z_vec[valid_idx]
+) %>% filter(!is.na(weight))
+
+## ---- Sample candidate mesh points from KDE weight ----
+mesh_points <- dplyr::sample_n(sample_pool, size = 600, weight = weight, replace = FALSE)
+
+## ---- Boundary (non-convex hull fits CA-like coastlines better) ----
+boundary <- inla.nonconvex.hull(as.matrix(coords), convex = -0.05)
+
+## ---- Build 2D triangular mesh ----
+mesh <- inla.mesh.2d(
+  loc     = as.matrix(mesh_points[, c("x", "y")]),
+  boundary = boundary,
+  max.edge = c(0.3, 1.0),  # smaller -> finer mesh near data, adjust as needed
+  cutoff   = 0.05          # minimum distance to avoid overly dense duplicates
+)
+
+## ---- (Optional) Visualize Mesh + points ----
+plot(mesh, asp = 1, main = "Spatial Mesh (KDE-based)")
+points(coords$x, coords$y, col = rgb(0,0,0,0.1), pch = 16, cex = 0.3)
+
+## =============================================================================
+##                           Quick mesh quality checks
+## =============================================================================
+op <- par(mfrow = c(1,2))
+plot(mesh, asp = 1, main = "KDE-based Mesh (with buffer)")
+points(coords$x, coords$y, col = rgb(0,0,0,0.1), pch = 16, cex = 0.3)
+
+ta <- INLA:::inla.mesh.fem(mesh)$ta   # triangle areas
+hist(ta, breaks = 30, main = "Triangle area distribution", xlab = "Area")
+par(op)
+
+cat(sprintf("\nMesh QC: triangles=%d, area range=[%.4f, %.4f], median=%.4f\n",
+            length(ta), min(ta), max(ta), median(ta)))
+
+## =============================================================================
+##                           SPDE model (PC priors)
+## =============================================================================
+## NOTE: Set priors to your calibrated values. The following are placeholders.
+## prior.range = c(r0, pr0) encodes P(range < r0) = pr0
+## prior.sigma = c(s0, ps0) encodes P(sigma > s0) = ps0
+spde <- inla.spde2.pcmatern(
+  mesh = mesh,
+  prior.range = c(0.5, 0.5),   # <-- replace with your tuned prior
+  prior.sigma = c(1.0, 0.01)   # <-- replace with your tuned prior
+)
+
+## =============================================================================
+##                           inlabru components & data
+## =============================================================================
+## In inlabru v2, a common pattern is to feed coordinates via SpatialPoints or
+## via a mapper. Here we use SpatialPoints for clarity.
+bru_data <- data.frame(
+  x    = coords$x,
+  y    = coords$y,
+  mags = eq_filtered$mags
+)
+sp::coordinates(bru_data) <- ~ x + y
+
+## Component: spatial random field + intercept
+## The name 'spatial' must match the term used in formula on the RHS.
+cmp <- ~ Intercept(1) + spatial(coordinates, model = spde)
+
+## =============================================================================
+##                           Fit model with CPO/PIT
+## =============================================================================
+## IMPORTANT:
+##  - Replace 'gaussian' and the formula on the next line to match your b-value
+##    observation model. For example, if modeling magnitudes directly with
+##    Gaussian errors: mags ~ Intercept + spatial
+##  - If you use a different likelihood (e.g., Poisson for counts/intensity),
+##    change 'family' and formula accordingly.
+fit <- bru(
+  components = cmp,
+  family     = "gaussian",                     # <-- replace to your likelihood
+  formula    = mags ~ Intercept + spatial,     # <-- replace to your model formula
+  data       = bru_data,
+  options    = list(
+    control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+    control.inla    = list(int.strategy = "eb")
+  )
+)
+
+## ---- Basic summaries ----
+cat("\nModel fit summary (fixed effects):\n")
+print(fit$summary.fixed)
+
+if (!is.null(fit$summary.hyperpar)) {
+  cat("\nHyperparameters summary:\n")
+  print(fit$summary.hyperpar)
+}
+
+if (!is.null(fit$dic$dic))  cat(sprintf("\nDIC:  %.3f\n", fit$dic$dic))
+if (!is.null(fit$waic$waic)) cat(sprintf("WAIC: %.3f\n", fit$waic$waic))
+
+## =============================================================================
+##                           CPO / PIT diagnostics
+## =============================================================================
+if (!is.null(fit$cpo)) {
+  # CPO failures
+  if (!is.null(fit$cpo$failure)) {
+    cpo_fail <- sum(fit$cpo$failure > 0, na.rm = TRUE)
+    cpo_rate <- cpo_fail / length(fit$cpo$failure)
+    cat(sprintf("\nCPO failures: %d (rate = %.3f)\n", cpo_fail, cpo_rate))
+  }
+  
+  # -log(CPO) summary (extreme values may flag bad fit/outliers)
+  if (!is.null(fit$cpo$cpo)) {
+    neglogcpo <- -log(fit$cpo$cpo)
+    cat("\nSummary of -log(CPO):\n")
+    print(summary(neglogcpo))
+  }
+  
+  # PIT histogram ~ Uniform(0,1) if calibrated
+  if (!is.null(fit$cpo$pit)) {
+    hist(fit$cpo$pit, breaks = 20, main = "PIT histogram", xlab = "PIT")
+  }
+} else {
+  warning("fit$cpo is NULL; CPO/PIT not computed. Check control.compute$cpo=TRUE.")
+}
+
+## =============================================================================
+##                           Predict / Project (optional)
+## =============================================================================
+## If you want posterior of spatial field on mesh vertices:
+## s_field <- predict(fit, spatial, ~ value)
+## str(s_field)
+##
+## Or project to a grid:
+## prj <- inla.mesh.projector(mesh, xlim = range(coords$x), ylim = range(coords$y), dims = c(100, 100))
+## s_mean <- inla.mesh.project(prj, fit$summary.random$spatial$mean)
+## image(list(x = prj$x, y = prj$y, z = s_mean), main = "Spatial field mean")
+
+cat("\nDone.\n")
+
 
 ################################################################################
 ##### Search the optimal prior parameter combination with KDE ##########
@@ -559,8 +767,6 @@ summary(fit_vc)
 
 ##Prediction and visualization
 # ===============================
-# Prediction + Visualization (including variable coefficients and depth comparison) 
-# ===============================
 library(INLA)
 library(inlabru)
 library(dplyr)
@@ -660,10 +866,10 @@ pred_shallow <- predict_b(rep(q_shallow, nrow(coords_pred)), nsamp = 1000) %>% l
 pred_deep    <- predict_b(rep(q_deep,    nrow(coords_pred)), nsamp = 1000) %>% lonlat_back()
 
 p_shallow <- plot_raster(pred_shallow, "b_mean",
-                         sprintf("Mean b at shallow depth (Q25=%.2f)", q_shallow),
+                         sprintf("Mean b at shallow depth (Q25)", q_shallow),
                          "b-value", "plasma")
 p_deepmap <- plot_raster(pred_deep, "b_mean",
-                         sprintf("Mean b at deep depth (Q75=%.2f)", q_deep),
+                         sprintf("Mean b at deep depth (Q75)", q_deep),
                          "b-value", "plasma")
 print(p_shallow); print(p_deepmap)
 
@@ -714,3 +920,4 @@ p_slope_sd <- plot_raster(slope_df, "slope_sd",
 print(p_slope); print(p_slope_sd)
 
 ##Spatial model vs. spatial + depth model
+

@@ -886,17 +886,17 @@ library(ggplot2)
 library(dplyr)
 library(patchwork)
 
-# === 重新构建绘图数据 ===
+# === Reconstruct the ploting data ===
 results_heatmap <- results %>%
   mutate(
     range = factor(range, levels = sort(unique(range))),
     sigma = factor(sigma, levels = sort(unique(sigma)))
   )
 
-# === 最优设置（DIC最小） ===
+# === Optimal setting (minimum DIC) ===
 best_row <- results %>% arrange(DIC) %>% slice(1)
 
-# === DIC 热图 ===
+# === DIC hot map ===
 p_dic <- ggplot(results_heatmap, aes(x = range, y = sigma, fill = DIC)) +
   geom_tile(color = "white") +
   geom_text(aes(label = round(DIC, 1)), size = 3, color = "white") +
@@ -907,7 +907,7 @@ p_dic <- ggplot(results_heatmap, aes(x = range, y = sigma, fill = DIC)) +
        x = "Prior Range", y = "Prior Sigma", fill = "DIC") +
   theme_minimal()
 
-# === WAIC 热图 ===
+# === WAIC hot map ===
 p_waic <- ggplot(results_heatmap, aes(x = range, y = sigma, fill = WAIC)) +
   geom_tile(color = "white") +
   geom_text(aes(label = round(WAIC, 1)), size = 3, color = "white") +
@@ -918,7 +918,7 @@ p_waic <- ggplot(results_heatmap, aes(x = range, y = sigma, fill = WAIC)) +
        x = "Prior Range", y = "Prior Sigma", fill = "WAIC") +
   theme_minimal()
 
-# === 显示最终组合图 ===
+# === Display the final combination diagram ===
 p_dic / p_waic
 
 
@@ -1113,7 +1113,18 @@ analyze_sequence_pair <- function(seq, m0 = 2.5, window_days = 90) {
   res_after  <- fit_bvalue_segment(df_after, m0 = m0)
   
   if (is.null(res_before) || is.null(res_after)) return(NULL)
+  # Extract DIC and WAIC from both before and after fit results
+  dic_before <- ifelse(!is.null(res_before$fit), res_before$fit$dic$dic, NA)
+  waic_before <- ifelse(!is.null(res_before$fit), res_before$fit$waic$waic, NA)
   
+  dic_after <- ifelse(!is.null(res_after$fit), res_after$fit$dic$dic, NA)
+  waic_after <- ifelse(!is.null(res_after$fit), res_after$fit$waic$waic, NA)
+  
+  # Combine DIC and WAIC from both before and after for a single entry
+  dic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
+                         (dic_before + dic_after) / 2, NA)
+  waic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
+                          (waic_before + waic_after) / 2, NA)
   list(
     before = res_before,
     after = res_after,
@@ -1124,7 +1135,9 @@ analyze_sequence_pair <- function(seq, m0 = 2.5, window_days = 90) {
       b_before = res_before$mean,
       N_before = res_before$n,
       b_after = res_after$mean,
-      N_after = res_after$n
+      N_after = res_after$n,
+      DIC_combined = dic_combined,
+      WAIC_combined = waic_combined
     )
   )
 }
@@ -1193,7 +1206,6 @@ for (page in seq_len(n_pages)) {
 # ==== View or export summary ====
 print(summary_table)
 # write_csv(summary_table, "sequence_bvalue_summary.csv")
-
 
 
 
@@ -1420,20 +1432,32 @@ analyze_sequence_pair <- function(seq, m0 = 2.5, window_days = 90) {
   
   if (is.null(res_before) || is.null(res_after)) return(NULL)
   
+  # Extract DIC and WAIC from both before and after fit results
+  dic_before <- ifelse(!is.null(res_before$fit), res_before$fit$dic$dic, NA)
+  waic_before <- ifelse(!is.null(res_before$fit), res_before$fit$waic$waic, NA)
+  
+  dic_after <- ifelse(!is.null(res_after$fit), res_after$fit$dic$dic, NA)
+  waic_after <- ifelse(!is.null(res_after$fit), res_after$fit$waic$waic, NA)
+  
+  # Combine DIC and WAIC from both before and after for a single entry
+  dic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
+                         (dic_before + dic_after) / 2, NA)
+  waic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
+                          (waic_before + waic_after) / 2, NA)
+  
   list(
     before = res_before,
     after = res_after,
     seq = seq,
     summary = tibble(
-      mainshock = seq$mainshock_time,
+      mainshock_time = t0,
       mag = seq$mainshock_mag,
       b_before = res_before$mean,
-      ci_before = res_before$ci,
       N_before = res_before$n,
       b_after = res_after$mean,
-      ci_after = res_after$ci,
       N_after = res_after$n,
-      diff = round(res_after$mean - res_before$mean, 3)
+      DIC_combined = dic_combined,
+      WAIC_combined = waic_combined
     )
   )
 }

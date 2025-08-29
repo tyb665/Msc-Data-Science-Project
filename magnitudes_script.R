@@ -187,7 +187,7 @@ pl.line2 <- ggplot() +
 pl.line2
 
 # visualise first and second GR plots together
-(pl.line1|pl.line2)
+(pl.line1 | pl.line2)
 
 
 
@@ -245,7 +245,6 @@ ggplot(sim_data, aes(x = mag, fill = model)) +
   labs(title = "Simulated magnitude distributions", x = "Magnitude") +
   theme_minimal()
 
-  return(result)
 
 #####################
 ###Inlabru fitting###
