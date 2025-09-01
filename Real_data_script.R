@@ -282,56 +282,107 @@ ggplot() +
 # =========================
 # Time vs Magnitude (Intro)
 # =========================
+library(ggplot2)
 library(readr)
 library(dplyr)
-library(ggplot2)
 library(lubridate)
-library(scales)
 
-df <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv", show_col_types = FALSE) %>%
-  mutate(time = ymd_hms(time, quiet = TRUE),
-         date = as.Date(time)) %>%
-  filter(!is.na(date), !is.na(magnitude))
+# read data
+data <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv", show_col_types = FALSE)
 
-tmin <- as.Date("1932-01-01")
-tmax <- as.Date("2022-12-31")
-M0  <- 2.5
+# Parse time column to Date
+data <- data %>%
+  mutate(time = ymd_hms(time))  # Ensure proper time format
 
-# Calculate the annotation position: 92% on the right side, slightly above the dotted line
-x_lab <- tmin + round(as.numeric(tmax - tmin) * 0.92)
-y_lab <- M0 + 0.12
+# Set time window and completeness magnitude
+start_date <- as_datetime("1990-01-01")
+end_date   <- as_datetime("2022-12-31")
+M0 <- 2.5
 
-p_bin <- ggplot(df, aes(x = date, y = magnitude)) +
-  geom_bin2d(binwidth = c(365.25, 0.1)) +
-  scale_fill_viridis_c(
-    trans = "log10",
-    name = "Count\n(log scale)",
-    guide = guide_colorbar(barheight = unit(60, "pt"))
-  ) +
-  # White dotted line (M0)
-  geom_hline(yintercept = M0, linetype = "dashed", color = "white", linewidth = 0.6) +
-  annotate("label",
-           x = x_lab, y = y_lab,
-           label = sprintf("M0 = %.1f", M0),
-           label.size = 0,
-           fill = alpha("black", 0.35),
-           colour = "white", size = 3.8) +
+# Filter by time and magnitude
+mags_values <- data %>% 
+  filter(!is.na(magnitude),
+         !is.na(time),
+         time >= start_date,
+         time <= end_date,
+         magnitude >= M0) %>% 
+  pull(magnitude)
+
+# Create magnitude bins
+mags_bins <- seq(M0, max(mags_values), by = 0.1)
+
+# Calculate cumulative counts
+mags_counts <- vapply(mags_bins, \(bin) sum(mags_values >= bin), 0)
+log_counts <- log10(mags_counts)
+
+# Linear fit
+fit <- lm(log_counts ~ mags_bins)
+slope <- coef(fit)[2]
+b_value_est <- abs(round(slope, 3))
+line_value <- predict(fit)
+
+# Plot
+ggplot() +
+  geom_point(aes(x = mags_bins, y = log_counts), size = 2) +
+  geom_line(aes(x = mags_bins, y = line_value), color = "red") +
   labs(
-    title = "Earthquake magnitudes over time",
-    subtitle = "dashed line shows M0 = 2.5",
-    x = "Year", y = "Magnitude"
+    title = "Gutenberg–Richter Law (California, 1990–2022)",
+    subtitle = paste0("Linear fit slope = ", round(slope, 3), " → b ≈ ", b_value_est),
+    x = "Magnitude",
+    y = expression(log[10](N(M)))
   ) +
-  scale_x_date(
-    limits = c(tmin, tmax),
-    date_breaks = "10 years",
-    date_labels = "%Y",
-    expand = c(0.01, 0.01)
-  ) +
-  coord_cartesian(ylim = range(df$magnitude, na.rm = TRUE)) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "right")
+  theme_minimal(base_size = 14)
 
-p_bin
+
+
+
+
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(lubridate)
+library(patchwork)  
+
+# ==== Read data ====
+data <- read_csv("D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv", show_col_types = FALSE) %>%
+  mutate(time = ymd_hms(time)) %>%
+  filter(!is.na(magnitude), !is.na(time)) %>%
+  filter(time >= as_datetime("1990-01-01"), time <= as_datetime("2022-12-31"))
+
+# ==== Set bins ====
+M0 <- 2.5
+mag_bins <- seq(1.5, max(data$magnitude), by = 0.1)  
+
+# ==== Function to generate GR plot ====
+make_gr_plot <- function(mags_values, title_note) {
+  mags_counts <- vapply(mag_bins, function(bin) sum(mags_values >= bin), 0)
+  log_counts <- log10(mags_counts)
+  
+  fit <- lm(log_counts ~ mag_bins)
+  slope <- coef(fit)[2]
+  b_val <- abs(round(slope, 3))
+  fitted <- predict(fit)
+  
+  ggplot() +
+    geom_point(aes(x = mag_bins, y = log_counts), size = 2) +
+    geom_line(aes(x = mag_bins, y = fitted), color = "red") +
+    labs(
+      title = paste("Gutenberg–Richter Fit", title_note),
+      subtitle = paste0("Slope = ", round(slope, 3), " → b ≈ ", b_val),
+      x = "Magnitude",
+      y = expression(log[10](N(M)))
+    ) +
+    theme_minimal(base_size = 13)
+}
+
+# ==== A. No completeness filtering ====
+plot_all <- make_gr_plot(data$magnitude, "(M ≥ 2.5)")
+show(plot_all)
+# ==== B. With Mc = 2.5 filtering ====
+plot_filtered <- make_gr_plot(data %>% filter(magnitude >= M0) %>% pull(magnitude), "(No M0 filtering)")
+show(plot_filtered)
+# ==== Combine plots ====
+plot_all + plot_filtered + plot_layout(ncol = 2)
 
 #################################################
 # Space vs magnitude
@@ -353,11 +404,16 @@ ca_map  <- subset(usa_map, region == "california")
 # Hexagonal density (bins can be fine-tuned as needed)
 p_hex <- ggplot(df, aes(x = x, y = y)) +
   geom_hex(bins = 70) +
-  scale_fill_viridis_c(trans = "log10", name = "Count\n(log scale)") +
+  scale_fill_viridis_c(
+    trans = "log10",
+    labels = function(x) scales::math_format(10^.x)(log10(x)),
+    name = "Count"
+  ) +
   geom_point(data = df[sample.int(nrow(df), min(3000, nrow(df))), ],
              aes(x = x, y = y), color = "black", alpha = 0.15, size = 0.2) +
-  geom_path(data = ca_map, aes(x = long, y = lat, group = group),
-            color = "black", linewidth = 0.5) +
+  geom_path(data = ca_map, aes(x = long, y = lat, group = group, linetype = "California border"),
+            color = "black", linewidth = 0.5, show.legend = TRUE) +
+  scale_linetype_manual(name = NULL, values = c("California border" = "solid")) + 
   labs(
     title = "Spatial distribution of seismicity (M ≥ 2.5)",
     x = "Longitude", y = "Latitude"
@@ -367,3 +423,4 @@ p_hex <- ggplot(df, aes(x = x, y = y)) +
   theme(legend.position = "right")
 
 p_hex
+

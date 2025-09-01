@@ -206,12 +206,12 @@ cutoff_types <- c()
 for (i in seq_len(nrow(filtered_mainshocks))) {
   mainshock <- filtered_mainshocks[i, ]
   
-  # 原始主震时间用于展示
+  # The original main shock time is used for display
   t0_orig <- mainshock$time
   mag0 <- mainshock$mag
   time_win_before <- 30
   
-  # 用于窗口计算的主震时间（整天截断）
+  # The main shock time used for window calculation (truncated throughout the day)
   t0 <- as.POSIXct(as.Date(t0_orig), tz = "UTC")
   
   full_window <- eq_data %>%
@@ -309,7 +309,7 @@ library(patchwork)
 
 # ==== Set environment ====
 Sys.setlocale("LC_TIME", "English")
-Sys.setenv(TMPDIR = "D:/R_temp")  # 设置临时目录（根据你电脑可修改）
+Sys.setenv(TMPDIR = "D:/R_temp")  # Set a temporary directory 
 
 # ==== Load data ====
 file_path <- "D:/project data/MSc_Data_Science_Project/combined_earthquakes_cleaned.csv"
@@ -734,10 +734,10 @@ for (m0 in m0_list) {
     )
     
     # Plot
-    # 获取当前样本数 N
+    # Obtain the current sample size N
     N <- nrow(filter(eq_data, mag >= m0))
     
-    # 绘图
+    # Plot
     p <- ggplot(pred_df, aes(x = day)) +
       geom_ribbon(aes(ymin = q0.025, ymax = q0.975), fill = "grey80") +
       geom_line(aes(y = mean), color = "black", size = 1) +
@@ -1060,152 +1060,191 @@ sequence_list <- Filter(function(seq) seq$mainshock_time >= as.POSIXct("1990-01-
 ################################################################################
 
 # ==== Function: KDE-based b-value fitting for one segment ====
-fit_bvalue_segment <- function(df_segment, m0 = 2.5, range_prior = 116.9, sigma_prior = 0.1, min_n = 20) {
-  df_segment <- df_segment %>%
-    filter(mag >= m0) %>%
-    mutate(day = as.numeric(difftime(time, min(time), units = "days")),
-           mags = mag - m0)
+# Unification: Global time origin
+time0_global <- as.POSIXct("1990-01-01", tz = "UTC")
+
+# Fit the entire sequence (once INLA/inlabru) and cut pre/post from the same curve
+time0_global <- as.POSIXct("1990-01-01", tz = "UTC")
+
+fit_sequence_once <- function(df_segment_full, t0, m0 = 2.5,
+                              range_prior = 116.9, sigma_prior = 0.1,
+                              min_n = 20, bw_kde = 30) {
+  # Event count statistics (by m0
+  df_events <- df_segment_full %>% dplyr::filter(mag >= m0)
   
-  if (nrow(df_segment) < min_n) return(NULL)
+  N_before_events <- df_events %>% dplyr::filter(time <  t0) %>% nrow()
+  N_after_events  <- df_events %>% dplyr::filter(time >= t0) %>% nrow()
   
-  kde <- density(df_segment$day, bw = 30)
+  # Fit data
+  df <- df_events %>%
+    dplyr::mutate(
+      day  = as.numeric(difftime(time, time0_global, units = "days")),
+      mags = mag - m0
+    )
+  if (nrow(df) < min_n) return(NULL)
+  
+  kde <- density(df$day, bw = bw_kde)
   mesh_points <- sample(kde$x, size = min(100, length(kde$x)), prob = kde$y, replace = FALSE)
-  mesh_points <- sort(unique(c(min(df_segment$day), mesh_points, max(df_segment$day))))
+  mesh_points <- sort(unique(c(min(df$day), mesh_points, max(df$day))))
   mesh <- fm_mesh_1d(mesh_points, degree = 2, boundary = "free")
   
-  spde <- inla.spde2.pcmatern(
-    mesh,
-    prior.range = c(range_prior, 0.01),
-    prior.sigma = c(sigma_prior, 0.01)
-  )
-  
+  spde <- inla.spde2.pcmatern(mesh,
+                              prior.range = c(range_prior, 0.01),
+                              prior.sigma = c(sigma_prior, 0.01))
   comp <- mags ~ field(day, model = spde) + Intercept(1)
   
   fit <- tryCatch({
-    bru(
-      components = comp,
-      data = df_segment,
-      family = "exponential",
-      options = list(control.compute = list(dic = TRUE, waic = TRUE))
-    )
-  }, error = function(e) return(NULL))
-  
+    bru(components = comp, data = df, family = "exponential",
+        options = list(control.compute = list(dic=TRUE, waic=TRUE, config=TRUE)))
+  }, error = function(e) NULL)
   if (is.null(fit)) return(NULL)
   
-  pred <- predict(fit, data.frame(day = seq(0, max(df_segment$day), by = 1)),
+  # Unified Curve prediction
+  day_grid <- seq(min(df$day), max(df$day), by = 1)
+  pred <- predict(fit, data.frame(day = day_grid),
                   ~ exp(field + Intercept) / log(10), n.samples = 1000)
   
-  list(pred = pred,
-       mean = round(mean(pred$mean), 3),
-       ci = round(quantile(pred$mean, c(0.025, 0.975)), 3),
-       n = nrow(df_segment))
+  # Cut pre/post based on t0
+  t0_day <- as.numeric(difftime(t0, time0_global, units = "days"))
+  pred$segment <- ifelse(pred$day < t0_day, "Before", "After")
+  
+  # Segmented indicators (using the same curve)
+  summarize_seg <- function(p) dplyr::tibble(
+    mean_b = mean(p$mean, na.rm = TRUE),
+    ci_low = quantile(p$mean, 0.025, na.rm = TRUE),
+    ci_high= quantile(p$mean, 0.975, na.rm = TRUE)
+  )
+  sum_before <- summarize_seg(dplyr::filter(pred, segment=="Before"))
+  sum_after  <- summarize_seg(dplyr::filter(pred, segment=="After"))
+  
+  list(
+    fit = fit,
+    pred = pred,
+    summary = dplyr::tibble(
+      b_before = sum_before$mean_b, ci_before_low = sum_before$ci_low,  ci_before_high = sum_before$ci_high,
+      b_after  = sum_after$mean_b,  ci_after_low  = sum_after$ci_low,   ci_after_high  = sum_after$ci_high,
+      N_before = N_before_events,    N_after      = N_after_events,
+      diff     = sum_after$mean_b - sum_before$mean_b
+    )
+  )
 }
 
 # ==== Function: Analyze one mainshock sequence ====
-analyze_sequence_pair <- function(seq, m0 = 2.5, window_days = 90) {
-  t0 <- seq$mainshock_time
-  seq_data <- seq$sequence_data
+
+analyze_sequence_once <- function(seq, m0 = 2.5, window_days = 90,
+                                  range_prior = 116.9, sigma_prior = 0.1) {
+  t0  <- seq$mainshock_time
+  dat <- seq$sequence_data %>%
+    filter(time >= t0 - days(window_days),
+           time <= t0 + days(window_days))
+  res <- fit_sequence_once(dat, t0 = t0, m0 = m0,
+                           range_prior = range_prior, sigma_prior = sigma_prior)
+  if (is.null(res)) return(NULL)
   
-  df_before <- seq_data %>% filter(time >= t0 - days(window_days), time < t0)
-  df_after  <- seq_data %>% filter(time > t0, time <= t0 + days(window_days))
-  
-  res_before <- fit_bvalue_segment(df_before, m0 = m0)
-  res_after  <- fit_bvalue_segment(df_after, m0 = m0)
-  
-  if (is.null(res_before) || is.null(res_after)) return(NULL)
-  # Extract DIC and WAIC from both before and after fit results
-  dic_before <- ifelse(!is.null(res_before$fit), res_before$fit$dic$dic, NA)
-  waic_before <- ifelse(!is.null(res_before$fit), res_before$fit$waic$waic, NA)
-  
-  dic_after <- ifelse(!is.null(res_after$fit), res_after$fit$dic$dic, NA)
-  waic_after <- ifelse(!is.null(res_after$fit), res_after$fit$waic$waic, NA)
-  
-  # Combine DIC and WAIC from both before and after for a single entry
-  dic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
-                         (dic_before + dic_after) / 2, NA)
-  waic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
-                          (waic_before + waic_after) / 2, NA)
-  list(
-    before = res_before,
-    after = res_after,
-    seq = seq,
-    summary = tibble(
-      mainshock_time = t0,
-      mag = seq$mainshock_mag,
-      b_before = res_before$mean,
-      N_before = res_before$n,
-      b_after = res_after$mean,
-      N_after = res_after$n,
-      DIC_combined = dic_combined,
-      WAIC_combined = waic_combined
-    )
-  )
+  res$summary <- res$summary %>%
+    mutate(mainshock_time = t0,
+           mag            = seq$mainshock_mag)
+  res
 }
 
-# ==== Function: Plot one before/after b-value curve with label ====
-plot_bvalue_segment_split <- function(seq, res_before, res_after) {
-  pred_b <- res_before$pred
-  pred_a <- res_after$pred
-  pred_b$group <- "Before"
-  pred_a$group <- "After"
-  
-  offset <- max(pred_b$day) + 10
-  pred_a$day <- pred_a$day + offset
-  plot_data <- bind_rows(pred_b, pred_a)
-  
-  label_text <- paste0(
-    format(seq$mainshock_time, "%Y-%m-%d"), "\n",
-    "M", round(seq$mainshock_mag, 1), "\n",
-    "b_before = ", res_before$mean, " (N=", res_before$n, ")\n",
-    "b_after  = ", res_after$mean,  " (N=", res_after$n, ")"
-  )
-  
-  ggplot(plot_data, aes(x = day)) +
-    geom_ribbon(aes(ymin = q0.025, ymax = q0.975, fill = group), alpha = 0.2) +
-    geom_line(aes(y = mean, color = group), size = 1.2) +
-    annotate("text", x = min(plot_data$day), y = 1.7, label = label_text,
-             hjust = 0, vjust = 1, fontface = "italic", size = 3.2) +
-    labs(x = "Days since segment start", y = "b-value") +
-    coord_cartesian(ylim = c(0.3, 1.8)) +
-    theme_minimal(base_size = 11) +
-    scale_color_manual(values = c("Before" = "blue", "After" = "red")) +
-    scale_fill_manual(values = c("Before" = "blue", "After" = "red")) +
-    theme(legend.position = "none")
-}
-
-# ==== Main execution block ====
+# 主循环（替换你原来的“前后各拟合一次”的循环）
 summary_table <- tibble()
 plot_list <- list()
 
 for (i in seq_along(sequence_list)) {
-  seq <- sequence_list[[i]]
-  cat("\n▶️ Processing sequence", i, ":", format(seq$mainshock_time, "%Y-%m-%d"), "\n")
-  res <- analyze_sequence_pair(seq, m0 = 2.5, window_days = 90)
-  
-  if (!is.null(res)) {
-    plot_list[[length(plot_list) + 1]] <- plot_bvalue_segment_split(res$seq, res$before, res$after)
-    summary_table <- bind_rows(summary_table, res$summary)
-  } else {
-    cat("❌ Sequence skipped (insufficient data or model failure)\n")
+  cat("\n▶️ Seq", i, ":", format(sequence_list[[i]]$mainshock_time, "%Y-%m-%d"), "\n")
+  res <- analyze_sequence_once(sequence_list[[i]], m0 = 2.5, window_days = 90)
+  if (is.null(res)) {
+    cat("❌ Sequence skipped\n"); next
   }
-}
+  summary_table <- bind_rows(summary_table, res$summary)
+  
+  pred <- res$pred
+  sumry <- res$summary
+  t0_day <- as.numeric(difftime(sequence_list[[i]]$mainshock_time, time0_global, units = "days"))
+  
+  # Take the main shock as 0 and the left and right sides as the symmetric number of days
+  pred <- pred %>% dplyr::mutate(x_rel = day - t0_day)
+  pred_b <- dplyr::filter(pred, segment == "Before")
+  pred_a <- dplyr::filter(pred, segment == "After")
+  
+  xmin <- min(pred$x_rel, na.rm = TRUE)
+  xmax <- max(pred$x_rel, na.rm = TRUE)
+  
+  title_date <- format(sequence_list[[i]]$mainshock_time, "%Y-%m-%d")
+  title_mag  <- sprintf("M%.1f", sequence_list[[i]]$mainshock_mag)
+  label_text <- sprintf("%s\n%s\nb_before = %.3f (N=%d)\nb_after  = %.3f (N=%d)",
+                        title_date, title_mag,
+                        sumry$b_before, sumry$N_before,
+                        sumry$b_after,  sumry$N_after)
+  
+  y_top <- max(pred$q0.975, na.rm = TRUE) + 0.05
+  
+  p <- ggplot() +
+    # BEFORE blue
+    geom_ribbon(data = pred_b, aes(x = x_rel, ymin = q0.025, ymax = q0.975),
+                fill = "steelblue", alpha = 0.18) +
+    geom_line(data = pred_b, aes(x = x_rel, y = mean),
+              color = "steelblue", linewidth = 1) +
+    geom_rect(aes(xmin = min(pred_b$x_rel, na.rm=TRUE),
+                  xmax = max(pred_b$x_rel, na.rm=TRUE),
+                  ymin = sumry$ci_before_low,
+                  ymax = sumry$ci_before_high),
+              fill = "steelblue", alpha = 0.15) +
+    geom_segment(aes(x = min(pred_b$x_rel, na.rm=TRUE),
+                     xend = max(pred_b$x_rel, na.rm=TRUE),
+                     y = sumry$b_before, yend = sumry$b_before),
+                 color = "steelblue", linewidth = 1.1, lineend = "round") +
+    
+    # AFTER red
+    geom_ribbon(data = pred_a, aes(x = x_rel, ymin = q0.025, ymax = q0.975),
+                fill = "red", alpha = 0.18) +
+    geom_line(data = pred_a, aes(x = x_rel, y = mean),
+              color = "red", linewidth = 1) +
+    geom_rect(aes(xmin = min(pred_a$x_rel, na.rm=TRUE),
+                  xmax = max(pred_a$x_rel, na.rm=TRUE),
+                  ymin = sumry$ci_after_low,
+                  ymax = sumry$ci_after_high),
+              fill = "red", alpha = 0.15) +
+    geom_segment(aes(x = min(pred_a$x_rel, na.rm=TRUE),
+                     xend = max(pred_a$x_rel, na.rm=TRUE),
+                     y = sumry$b_after, yend = sumry$b_after),
+                 color = "red", linewidth = 1.1, lineend = "round") +
+    
+    # The main shock vertical line (currently at x=0)
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    
+    # Add information
+    annotate("text", x = xmin + 0.02*(xmax - xmin), y = y_top,
+             label = label_text, hjust = 0, vjust = 1, size = 3.6) +
+    
+    labs(x = "Days since sequence start", y = "b-value") +
+    coord_cartesian(ylim = c(0.4, max(1.8, y_top))) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none")
+  
+  plot_list[[length(plot_list) + 1]] <- p
+} 
+ 
 
-# ==== Plot and optionally save ====
+
+# Show
 plots_per_page <- 6
 n_pages <- ceiling(length(plot_list) / plots_per_page)
-
 for (page in seq_len(n_pages)) {
   start <- (page - 1) * plots_per_page + 1
-  end <- min(page * plots_per_page, length(plot_list))
-  page_plot <- wrap_plots(plot_list[start:end], ncol = 2)
+  end   <- min(page * plots_per_page, length(plot_list))
+  page_plot <- patchwork::wrap_plots(plot_list[start:end], ncol = 2)
   print(page_plot)
-  # Optional: save
-  ggsave(paste0("sequence_page_", page, ".png"), page_plot, width = 10, height = 8, dpi = 300)
+  # ggsave(paste0("sequence_page_singlefit_", page, ".png"), page_plot, width = 10, height = 8, dpi = 300)
 }
 
-# ==== View or export summary ====
-print(summary_table)
-# write_csv(summary_table, "sequence_bvalue_summary.csv")
+# Print summary
+print(summary_table %>%
+        select(mainshock_time, mag,
+               b_before, ci_before_low, ci_before_high, N_before,
+               b_after,  ci_after_low,  ci_after_high,  N_after,
+               diff))
 
 
 
@@ -1370,96 +1409,102 @@ library(tidyr)
 library(stringr)
 
 # ==== Function: KDE-based b-value fitting for one segment with depth ====
-fit_bvalue_segment <- function(df_segment, m0 = 2.5, range_prior = 116.9, sigma_prior = 0.1, min_n = 20) {
-  df_segment <- df_segment %>%
-    filter(mag >= m0) %>%
-    drop_na(depth) %>%
-    mutate(
-      day = as.numeric(difftime(time, min(time), units = "days")),
-      mags = mag - m0,
-      depth_scaled = scale(depth)[, 1]
-    )
+# Unification: Global time origin
+time0_global <- as.POSIXct("1990-01-01", tz = "UTC")
+
+# Fit the entire sequence (once INLA/inlabru) 
+time0_global <- as.POSIXct("1990-01-01", tz = "UTC")
+
+# One-time fitting：log β(t) = Intercept + field(t) + β_depth * depth_scaled
+fit_sequence_once_with_depth <- function(df_segment_full, t0,
+                                         m0 = 2.5,
+                                         range_prior = 116.9,
+                                         sigma_prior = 0.1,
+                                         min_n = 20,
+                                         bw_kde = 30) {
+  df_events <- df_segment_full %>% filter(mag >= m0) %>% drop_na(depth)
+  N_before_events <- df_events %>% filter(time <  t0) %>% nrow()
+  N_after_events  <- df_events %>% filter(time >= t0) %>% nrow()
   
-  if (nrow(df_segment) < min_n) return(NULL)
+  df <- df_events %>% mutate(
+    day          = as.numeric(difftime(time, time0_global, units = "days")),
+    mags         = mag - m0,
+    depth_scaled = as.numeric(scale(depth)[, 1])
+  )
+  if (nrow(df) < min_n) return(NULL)
   
-  kde <- density(df_segment$day, bw = 30)
+  kde <- density(df$day, bw = bw_kde)
   mesh_points <- sample(kde$x, size = min(100, length(kde$x)), prob = kde$y, replace = FALSE)
-  mesh_points <- sort(unique(c(min(df_segment$day), mesh_points, max(df_segment$day))))
+  mesh_points <- sort(unique(c(min(df$day), mesh_points, max(df$day))))
   mesh <- fm_mesh_1d(mesh_points, degree = 2, boundary = "free")
   
-  spde <- inla.spde2.pcmatern(
-    mesh,
-    prior.range = c(range_prior, 0.01),
-    prior.sigma = c(sigma_prior, 0.01)
-  )
+  spde <- inla.spde2.pcmatern(mesh,
+                              prior.range = c(range_prior, 0.01),
+                              prior.sigma = c(sigma_prior, 0.01))
   
   comp <- mags ~ field(day, model = spde) + depth_scaled + Intercept(1)
   
   fit <- tryCatch({
     bru(
       components = comp,
-      data = df_segment,
+      data = df,
       family = "exponential",
-      options = list(control.compute = list(dic = TRUE, waic = TRUE, config = TRUE))
+      options = list(
+        control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE)
+      )
     )
-  }, error = function(e) return(NULL))
-  
+  }, error = function(e) NULL)
   if (is.null(fit)) return(NULL)
   
-  pred <- predict(fit, data.frame(day = seq(0, max(df_segment$day), by = 1), depth_scaled = 0),
-                  ~ exp(field + Intercept) / log(10), n.samples = 1000)
+  # Unified curve prediction (at depth = 0)
+  day_grid <- seq(min(df$day), max(df$day), by = 1)
+  pred <- predict(
+    fit, data.frame(day = day_grid, depth_scaled = 0),
+    ~ exp(field + Intercept) / log(10), n.samples = 1000
+  )
   
-  ci <- round(quantile(pred$mean, c(0.025, 0.975)), 3)
+  # Segments (the same curve)
+  t0_day <- as.numeric(difftime(t0, time0_global, units = "days"))
+  pred$segment <- ifelse(pred$day < t0_day, "Before", "After")
+  
+  summarize_seg <- function(p) tibble(
+    mean_b = mean(p$mean, na.rm = TRUE),
+    ci_low = quantile(p$mean, 0.025, na.rm = TRUE),
+    ci_high= quantile(p$mean, 0.975, na.rm = TRUE)
+  )
+  sum_before <- summarize_seg(dplyr::filter(pred, segment == "Before"))
+  sum_after  <- summarize_seg(dplyr::filter(pred, segment == "After"))
+  
+  # Extract DIC/WAIC
+  dic_val  <- if (!is.null(fit$dic$dic))   as.numeric(fit$dic$dic)   else NA_real_
+  waic_val <- if (!is.null(fit$waic$waic)) as.numeric(fit$waic$waic) else NA_real_
+  # Optional: Average -log CPO as an additional diagnosis
+  lcpo_val <- if (!is.null(fit$cpo$cpo)) mean(-log(fit$cpo$cpo), na.rm = TRUE) else NA_real_
   
   list(
+    fit = fit,
     pred = pred,
-    mean = round(mean(pred$mean), 3),
-    ci = paste0("[", ci[1], ", ", ci[2], "]"),
-    n = nrow(df_segment)
+    summary = tibble(
+      b_before = sum_before$mean_b, ci_before_low = sum_before$ci_low,  ci_before_high = sum_before$ci_high,
+      b_after  = sum_after$mean_b,  ci_after_low  = sum_after$ci_low,   ci_after_high  = sum_after$ci_high,
+      N_before = N_before_events,   N_after       = N_after_events,
+      diff     = sum_after$mean_b - sum_before$mean_b,
+      DIC = dic_val, WAIC = waic_val, LCPO = lcpo_val
+    )
   )
 }
 
-# ==== Function: Analyze one mainshock sequence ====
-analyze_sequence_pair <- function(seq, m0 = 2.5, window_days = 90) {
-  t0 <- seq$mainshock_time
-  seq_data <- seq$sequence_data
-  
-  df_before <- seq_data %>% filter(time >= t0 - days(window_days), time < t0)
-  df_after  <- seq_data %>% filter(time > t0, time <= t0 + days(window_days))
-  
-  res_before <- fit_bvalue_segment(df_before, m0 = m0)
-  res_after  <- fit_bvalue_segment(df_after, m0 = m0)
-  
-  if (is.null(res_before) || is.null(res_after)) return(NULL)
-  
-  # Extract DIC and WAIC from both before and after fit results
-  dic_before <- ifelse(!is.null(res_before$fit), res_before$fit$dic$dic, NA)
-  waic_before <- ifelse(!is.null(res_before$fit), res_before$fit$waic$waic, NA)
-  
-  dic_after <- ifelse(!is.null(res_after$fit), res_after$fit$dic$dic, NA)
-  waic_after <- ifelse(!is.null(res_after$fit), res_after$fit$waic$waic, NA)
-  
-  # Combine DIC and WAIC from both before and after for a single entry
-  dic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
-                         (dic_before + dic_after) / 2, NA)
-  waic_combined <- ifelse(!is.null(res_before$fit) && !is.null(res_after$fit), 
-                          (waic_before + waic_after) / 2, NA)
-  
-  list(
-    before = res_before,
-    after = res_after,
-    seq = seq,
-    summary = tibble(
-      mainshock_time = t0,
-      mag = seq$mainshock_mag,
-      b_before = res_before$mean,
-      N_before = res_before$n,
-      b_after = res_after$mean,
-      N_after = res_after$n,
-      DIC_combined = dic_combined,
-      WAIC_combined = waic_combined
-    )
-  )
+# Encapsulation: Perform a fitting (including depth) on a single sequence once
+analyze_sequence_once_with_depth <- function(seq, m0 = 2.5, window_days = 90,
+                                             range_prior = 116.9, sigma_prior = 0.1) {
+  t0  <- seq$mainshock_time
+  dat <- seq$sequence_data %>%
+    filter(time >= t0 - lubridate::days(window_days),
+           time <= t0 + lubridate::days(window_days))
+  res <- fit_sequence_once_with_depth(dat, t0, m0, range_prior, sigma_prior)
+  if (is.null(res)) return(NULL)
+  res$summary <- res$summary %>% mutate(mainshock_time = t0, mag = seq$mainshock_mag)
+  res
 }
 
 # ==== Function: Plot one before/after b-value curve with label ====
@@ -1498,80 +1543,105 @@ summary_table <- tibble()
 plot_list <- list()
 
 for (i in seq_along(sequence_list)) {
-  seq <- sequence_list[[i]]
-  cat("\n▶️ Processing sequence", i, ":", format(seq$mainshock_time, "%Y-%m-%d"), "\n")
-  res <- analyze_sequence_pair(seq, m0 = 2.5, window_days = 90)
+  cat("\n▶️ Seq", i, ":", format(sequence_list[[i]]$mainshock_time, "%Y-%m-%d"), "\n")
   
-  if (!is.null(res)) {
-    plot_list[[length(plot_list) + 1]] <- plot_bvalue_segment_split(res$seq, res$before, res$after)
-    summary_table <- bind_rows(summary_table, res$summary)
-  } else {
-    cat("❌ Sequence skipped (insufficient data or model failure)\n")
+  res <- analyze_sequence_once_with_depth(sequence_list[[i]], m0 = 2.5, window_days = 90,
+                                          range_prior = 116.9, sigma_prior = 0.1)
+  if (is.null(res)) { cat("❌ Sequence skipped\n"); next }
+  
+  summary_table <- bind_rows(summary_table, res$summary)
+  
+  pred  <- res$pred
+  sumry <- res$summary
+  t0_day <- as.numeric(difftime(sequence_list[[i]]$mainshock_time, time0_global, units = "days"))
+  
+  # The relative time with the main shock as zero
+  pred <- pred %>% mutate(x_rel = day - t0_day)
+  pred_b <- filter(pred, segment == "Before")
+  pred_a <- filter(pred, segment == "After")
+  
+  xmin <- min(pred$x_rel, na.rm = TRUE); xmax <- max(pred$x_rel, na.rm = TRUE)
+  
+  title_date <- format(sequence_list[[i]]$mainshock_time, "%Y-%m-%d")
+  title_mag  <- sprintf("M%.1f", sequence_list[[i]]$mainshock_mag)
+  label_text <- sprintf("%s\n%s\nb_before = %.3f (N=%d)\nb_after  = %.3f (N=%d)",
+                        title_date, title_mag,
+                        sumry$b_before, sumry$N_before,
+                        sumry$b_after,  sumry$N_after)
+  
+  y_top <- max(pred$q0.975, na.rm = TRUE) + 0.05
+  
+  p <- ggplot() +
+    # BEFORE（blue）
+    geom_ribbon(data = pred_b, aes(x = x_rel, ymin = q0.025, ymax = q0.975),
+                fill = "steelblue", alpha = 0.18) +
+    geom_line(data = pred_b, aes(x = x_rel, y = mean),
+              color = "steelblue", linewidth = 1) +
+    geom_rect(aes(xmin = min(pred_b$x_rel, na.rm=TRUE),
+                  xmax = max(pred_b$x_rel, na.rm=TRUE),
+                  ymin = sumry$ci_before_low,
+                  ymax = sumry$ci_before_high),
+              fill = "steelblue", alpha = 0.15) +
+    geom_segment(aes(x = min(pred_b$x_rel, na.rm=TRUE),
+                     xend = max(pred_b$x_rel, na.rm=TRUE),
+                     y = sumry$b_before, yend = sumry$b_before),
+                 color = "steelblue", linewidth = 1.1, lineend = "round") +
+    
+    # AFTER（red）
+    geom_ribbon(data = pred_a, aes(x = x_rel, ymin = q0.025, ymax = q0.975),
+                fill = "red", alpha = 0.18) +
+    geom_line(data = pred_a, aes(x = x_rel, y = mean),
+              color = "red", linewidth = 1) +
+    geom_rect(aes(xmin = min(pred_a$x_rel, na.rm=TRUE),
+                  xmax = max(pred_a$x_rel, na.rm=TRUE),
+                  ymin = sumry$ci_after_low,
+                  ymax = sumry$ci_after_high),
+              fill = "red", alpha = 0.15) +
+    geom_segment(aes(x = min(pred_a$x_rel, na.rm=TRUE),
+                     xend = max(pred_a$x_rel, na.rm=TRUE),
+                     y = sumry$b_after, yend = sumry$b_after),
+                 color = "red", linewidth = 1.1, lineend = "round") +
+    
+    # The main shock vertical line (x=0)
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    
+    # Information in the upper left corner
+    annotate("text", x = xmin + 0.02*(xmax - xmin), y = y_top,
+             label = label_text, hjust = 0, vjust = 1, size = 3.6) +
+    
+    labs(x = "Days since sequence start", y = "b-value") +
+    coord_cartesian(ylim = c(0.4, max(1.8, y_top))) +
+    theme_minimal(base_size = 11) +
+    theme(legend.position = "none")
+  
+  plot_list[[length(plot_list) + 1]] <- p
+}
+
+if (length(plot_list) > 0) {
+  library(patchwork)
+  plots_per_page <- 6
+  n_pages <- ceiling(length(plot_list) / plots_per_page)
+  for (page in seq_len(n_pages)) {
+    start <- (page - 1) * plots_per_page + 1
+    end   <- min(page * plots_per_page, length(plot_list))
+    page_plot <- wrap_plots(plot_list[start:end], ncol = 2)  # 每页2列×3行
+    print(page_plot)
+    
+    ggsave(sprintf("sequence_depth_page_%02d.png", page),
+           page_plot, width = 12, height = 9, dpi = 300)
   }
+} else {
+  message("No plots generated.")
 }
-
-# ==== Plot and optionally save ====
-plots_per_page <- 6
-n_pages <- ceiling(length(plot_list) / plots_per_page)
-
-for (page in seq_len(n_pages)) {
-  start <- (page - 1) * plots_per_page + 1
-  end <- min(page * plots_per_page, length(plot_list))
-  page_plot <- wrap_plots(plot_list[start:end], ncol = 2)
-  print(page_plot)
-  ggsave(paste0("sequence_page_depth_", page, ".png"), page_plot, width = 10, height = 8, dpi = 300)
-}
-
-# ==== Summary plot with horizontal error bars ====
-tidy_bvalues <- summary_table %>%
-  mutate(seq_id = paste0("Seq ", row_number(), " @ ", substr(mainshock, 1, 10))) %>%
-  rowwise() %>%
-  mutate(
-    before_low = as.numeric(str_extract(ci_before, "(?<=\\[)[^,]+")),
-    before_high = as.numeric(str_extract(ci_before, "(?<=, )[^\\]]+")),
-    after_low = as.numeric(str_extract(ci_after, "(?<=\\[)[^,]+")),
-    after_high = as.numeric(str_extract(ci_after, "(?<=, )[^\\]]+"))
-  ) %>%
-  select(seq_id, b_before, before_low, before_high,
-         b_after, after_low, after_high, diff) %>%
-  pivot_longer(
-    cols = c(b_before, b_after),
-    names_to = "group", values_to = "b_value"
-  ) %>%
-  mutate(
-    group = ifelse(group == "b_before", "Before", "After"),
-    ci_low = ifelse(group == "Before", before_low, after_low),
-    ci_high = ifelse(group == "Before", before_high, after_high)
-  ) %>%
-  select(seq_id, group, b_value, ci_low, ci_high, diff)
-
-diff_labels <- tidy_bvalues %>%
-  filter(group == "After") %>%
-  mutate(
-    label = paste0("Δ=", round(diff, 2)),
-    y = factor(seq_id, levels = rev(unique(tidy_bvalues$seq_id)))
-  )
-
-p_diff <- ggplot(tidy_bvalues, aes(x = b_value, y = factor(seq_id, levels = rev(unique(seq_id))), color = group)) +
-  geom_point(position = position_dodge(width = 0.5), size = 2) +
-  geom_errorbarh(aes(xmin = ci_low, xmax = ci_high), height = 0.25,
-                 position = position_dodge(width = 0.5)) +
-  geom_text(data = diff_labels,
-            aes(x = b_value + 0.05, y = y, label = label),
-            inherit.aes = FALSE,
-            color = "black", size = 3.5, hjust = 0) +
-  scale_color_manual(values = c("Before" = "blue", "After" = "red")) +
-  labs(
-    title = "Comparison of b-values Before and After Mainshocks (with depth)",
-    x = "b-value",
-    y = "Mainshock Sequence",
-    color = "Group"
-  ) +
-  theme_minimal(base_size = 13) +
-  xlim(0.5, max(tidy_bvalues$ci_high, na.rm = TRUE) + 0.4)
-
-print(p_diff)
-
-# ==== View or export summary ====
+# Print summary
 print(summary_table)
-# write_csv(summary_table, "sequence_bvalue_depth_summary.csv")
+
+# summary_table with DIC/WAIC
+dic_waic_table <- summary_table %>%
+  select(mainshock_time, mag, N_before, N_after, DIC, WAIC, LCPO, 
+         b_before, b_after, diff) %>%
+  arrange(WAIC)   # or arrange(DIC)
+
+print(dic_waic_table)
+
+
