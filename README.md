@@ -1,6 +1,6 @@
 # Msc-Data-Science-Project
 
-# 🧠 Earthquake Magnitude Modeling with INLA-SPDE
+# 🧠 Bayesian Modelling of the Earthquake Magnitude Distributions with Gaussian Process
 
 This project applies **Bayesian spatial and temporal modeling** to earthquake magnitude distributions in California using the **INLA-SPDE framework with inlabru**.  
 We estimate spatially varying **b-values**, explore the effect of **depth as a covariate**, and compare modeling strategies across both **synthetic** and **real-world earthquake catalogs**.
